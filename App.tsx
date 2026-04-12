@@ -102,13 +102,43 @@ type DiagnosticLogEntry = {
   timestamp: string;
 };
 
+type OnboardingSlide = {
+  eyebrow: string;
+  title: string;
+  body: string;
+};
+
 const API_BASE_CANDIDATES = ['http://127.0.0.1:3000', 'http://10.0.2.2:3000'];
 const SESSION_CACHE_KEY = 'wobb.mobile.session.v7';
 const SESSION_TOKEN_KEY = 'wobb.mobile.session-token.v4';
 const INSTALLATION_ID_KEY = 'wobb.mobile.installation-id.v1';
 const SELECTED_LOCATION_KEY = 'wobb.mobile.location.v1';
+const ONBOARDING_COMPLETE_KEY = 'wobb.mobile.onboarding.v1';
 const GOOGLE_WEB_CLIENT_ID =
   '157778125537-th8lu3rlhkm1gieqisv0e73lvdh0g5re.apps.googleusercontent.com';
+
+const ONBOARDING_SLIDES: OnboardingSlide[] = [
+  {
+    eyebrow: 'Fast secure connection',
+    title: 'Connect in seconds',
+    body: 'Set up your account, choose a server, and keep the flow simple from the first launch.',
+  },
+  {
+    eyebrow: 'Global access made simple',
+    title: 'Pick a server and go',
+    body: 'Refresh your session, switch locations, and use one clean connection path.',
+  },
+  {
+    eyebrow: 'Private by design',
+    title: 'Modern infrastructure',
+    body: 'Provisioning stays tied to your current account and subscription state.',
+  },
+  {
+    eyebrow: 'Ready to continue',
+    title: 'Sign in with Google',
+    body: 'Use your Google account to load your plan and create the current session.',
+  },
+];
 
 const COLORS = {
   background: '#08111f',
@@ -217,6 +247,14 @@ async function readSelectedLocation(): Promise<string | null> {
 
 async function writeSelectedLocation(locationId: string): Promise<void> {
   await storage.setItem(SELECTED_LOCATION_KEY, locationId);
+}
+
+async function readOnboardingComplete(): Promise<boolean> {
+  return (await storage.getItem(ONBOARDING_COMPLETE_KEY)) === '1';
+}
+
+async function writeOnboardingComplete(): Promise<void> {
+  await storage.setItem(ONBOARDING_COMPLETE_KEY, '1');
 }
 
 function formatBytes(bytes: number): string {
@@ -374,6 +412,8 @@ function stateTone(state: ConnectionState) {
 
 export default function App() {
   const [booting, setBooting] = useState(true);
+  const [onboardingComplete, setOnboardingComplete] = useState(false);
+  const [onboardingStep, setOnboardingStep] = useState(0);
   const [localConnectionState, setLocalConnectionState] = useState<ConnectionState>('idle');
   const [session, setSession] = useState<SessionData | null>(null);
   const [locations, setLocations] = useState<LocationItem[]>([]);
@@ -386,6 +426,7 @@ export default function App() {
 
   const effectiveConnectionState = deriveConnectionState(session, localConnectionState);
   const tone = stateTone(effectiveConnectionState);
+  const currentSlide = ONBOARDING_SLIDES[Math.min(onboardingStep, ONBOARDING_SLIDES.length - 1)];
   const selectedLocation = useMemo(() => {
     const targetId = selectedLocationId || session?.location.selectedId || null;
     if (!targetId) {
@@ -480,17 +521,19 @@ export default function App() {
       try {
         await GoogleSignin.configure({ webClientId: GOOGLE_WEB_CLIENT_ID, offlineAccess: false });
 
-        const [nextInstallationId, savedLocationId, cached, fetchedLocations] = await Promise.all([
+        const [nextInstallationId, savedLocationId, cached, fetchedLocations, onboardingDone] = await Promise.all([
           getInstallationId(),
           readSelectedLocation(),
           readCachedSession(),
-          fetchLocations()
+          fetchLocations(),
+          readOnboardingComplete()
         ]);
 
         if (cancelled) {
           return;
         }
 
+        setOnboardingComplete(onboardingDone);
         setInstallationId(nextInstallationId);
         setLocations(fetchedLocations);
         appendLog('app', 'Application initialized.');
@@ -578,6 +621,11 @@ export default function App() {
       }
     };
   }, [installationId, selectedLocationId, session?.user.id, session?.location.selectedId]);
+
+  async function handleCompleteOnboarding() {
+    await writeOnboardingComplete();
+    setOnboardingComplete(true);
+  }
 
   async function handleSignIn() {
     setErrorText(null);
@@ -762,16 +810,85 @@ export default function App() {
 
       {booting ? (
         <View style={styles.center}>
+          <View style={styles.logoBadge}>
+            <Text style={styles.logoBadgeText}>W</Text>
+          </View>
           <ActivityIndicator color={COLORS.accent} />
-          <Text style={styles.mutedText}>Starting Wobb</Text>
+          <Text style={styles.screenTitle}>Wobb</Text>
+          <Text style={styles.mutedText}>Preparing your local session.</Text>
+        </View>
+      ) : !onboardingComplete ? (
+        <View style={styles.onboardingRoot}>
+          <View style={styles.onboardingHero}>
+            <View style={styles.logoBadge}>
+              <Text style={styles.logoBadgeText}>W</Text>
+            </View>
+            <Text style={styles.onboardingEyebrow}>{currentSlide.eyebrow}</Text>
+            <Text style={styles.onboardingTitle}>{currentSlide.title}</Text>
+            <Text style={styles.onboardingBody}>{currentSlide.body}</Text>
+          </View>
+
+          <View style={styles.onboardingPanel}>
+            <View style={styles.featureCard}>
+              <Text style={styles.featureCardTitle}>Simple setup</Text>
+              <Text style={styles.featureCardBody}>
+                Sign in, choose a location, and keep the connection flow predictable.
+              </Text>
+            </View>
+            <View style={styles.featureCard}>
+              <Text style={styles.featureCardTitle}>Account-based access</Text>
+              <Text style={styles.featureCardBody}>
+                Subscription state, provisioning, and diagnostics all come from the backend.
+              </Text>
+            </View>
+
+            <View style={styles.onboardingDots}>
+              {ONBOARDING_SLIDES.map((_, index) => (
+                <View
+                  key={index}
+                  style={[styles.onboardingDot, index === onboardingStep && styles.onboardingDotActive]}
+                />
+              ))}
+            </View>
+
+            <View style={styles.onboardingActions}>
+              <Pressable style={styles.secondaryButton} onPress={handleCompleteOnboarding}>
+                <Text style={styles.secondaryButtonText}>Skip</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.primaryButton, styles.flexButton]}
+                onPress={() => {
+                  if (onboardingStep === ONBOARDING_SLIDES.length - 1) {
+                    handleCompleteOnboarding();
+                    return;
+                  }
+                  setOnboardingStep((current) => current + 1);
+                }}
+              >
+                <Text style={styles.primaryButtonText}>
+                  {onboardingStep === ONBOARDING_SLIDES.length - 1 ? 'Continue' : 'Next'}
+                </Text>
+              </Pressable>
+            </View>
+          </View>
         </View>
       ) : !session ? (
         <View style={styles.center}>
-          <Text style={styles.screenTitle}>Wobb</Text>
-          <Text style={styles.screenSubtitle}>Sign in to load your subscription and connect.</Text>
-          <Pressable style={styles.primaryButton} onPress={handleSignIn}>
-            <Text style={styles.primaryButtonText}>Sign in with Google</Text>
-          </Pressable>
+          <View style={styles.signInCard}>
+            <View style={styles.logoBadge}>
+              <Text style={styles.logoBadgeText}>W</Text>
+            </View>
+            <Text style={styles.screenTitle}>Wobb</Text>
+            <Text style={styles.signInText}>
+              Sign in to load your subscription, choose a server, and create a secure session.
+            </Text>
+            <Pressable style={[styles.primaryButton, styles.fullWidthButton]} onPress={handleSignIn}>
+              <Text style={styles.primaryButtonText}>Sign in with Google</Text>
+            </Pressable>
+            <Text style={styles.signInHint}>
+              Your account is used to verify access and load the current connection state.
+            </Text>
+          </View>
           {errorText ? <Text style={styles.errorText}>{errorText}</Text> : null}
         </View>
       ) : (
@@ -796,7 +913,7 @@ export default function App() {
               </Text>
               <Text style={styles.connectionSubtitle}>
                 {selectedLocation
-                  ? `${selectedLocation.city || 'Default'}${session.provisioning.assignedEndpoint ? ` · ${session.provisioning.assignedEndpoint}` : ''}`
+                  ? `${selectedLocation.city || 'Default edge'}${session.provisioning.assignedEndpoint ? ` - ${session.provisioning.assignedEndpoint}` : ''}`
                   : 'No endpoint assigned'}
               </Text>
             </View>
@@ -861,6 +978,11 @@ export default function App() {
                   : session.subscription.status}
               </Text>
             </View>
+            {session.subscription.blockedReason ? (
+              <Pressable style={styles.inlineAction} onPress={handleOpenTelegramPurchase}>
+                <Text style={styles.inlineActionText}>Open Telegram</Text>
+              </Pressable>
+            ) : null}
           </View>
 
           <View style={styles.panel}>
@@ -942,6 +1064,92 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
     gap: 12
+  },
+  onboardingRoot: {
+    flex: 1,
+    justifyContent: 'space-between',
+    padding: 20
+  },
+  onboardingHero: {
+    paddingTop: 40
+  },
+  logoBadge: {
+    width: 52,
+    height: 52,
+    borderRadius: 8,
+    backgroundColor: COLORS.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 18
+  },
+  logoBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: '700'
+  },
+  onboardingEyebrow: {
+    color: COLORS.accent,
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 14
+  },
+  onboardingTitle: {
+    color: COLORS.text,
+    fontSize: 34,
+    fontWeight: '700',
+    lineHeight: 40,
+    maxWidth: 280
+  },
+  onboardingBody: {
+    color: COLORS.muted,
+    fontSize: 16,
+    lineHeight: 24,
+    marginTop: 16,
+    maxWidth: 320
+  },
+  onboardingPanel: {
+    backgroundColor: COLORS.panel,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    padding: 18,
+    gap: 14
+  },
+  featureCard: {
+    backgroundColor: COLORS.panelMuted,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    padding: 14
+  },
+  featureCardTitle: {
+    color: COLORS.text,
+    fontSize: 15,
+    fontWeight: '600',
+    marginBottom: 6
+  },
+  featureCardBody: {
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 19
+  },
+  onboardingDots: {
+    flexDirection: 'row',
+    gap: 8
+  },
+  onboardingDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: COLORS.border
+  },
+  onboardingDotActive: {
+    width: 22,
+    backgroundColor: COLORS.accent
+  },
+  onboardingActions: {
+    flexDirection: 'row',
+    gap: 10
   },
   scrollContent: {
     padding: 16,
@@ -1078,22 +1286,54 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 18
   },
+  fullWidthButton: {
+    alignSelf: 'stretch'
+  },
+  flexButton: {
+    flex: 1
+  },
   primaryButtonText: {
     color: '#FFFFFF',
     fontWeight: '700'
   },
   secondaryButton: {
-    alignSelf: 'center',
+    flex: 1,
     borderRadius: 8,
     borderWidth: 1,
     borderColor: COLORS.border,
     paddingVertical: 10,
     paddingHorizontal: 14,
-    backgroundColor: COLORS.accentSoft
+    backgroundColor: COLORS.panelMuted,
+    alignItems: 'center',
+    justifyContent: 'center'
   },
   secondaryButtonText: {
     color: COLORS.text,
     fontWeight: '600'
+  },
+  signInCard: {
+    alignSelf: 'stretch',
+    backgroundColor: COLORS.panel,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    padding: 24,
+    alignItems: 'center'
+  },
+  signInText: {
+    color: COLORS.muted,
+    fontSize: 15,
+    lineHeight: 22,
+    textAlign: 'center',
+    marginTop: 10,
+    marginBottom: 20
+  },
+  signInHint: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 14,
+    textAlign: 'center'
   },
   detailRow: {
     flexDirection: 'row',
@@ -1191,6 +1431,21 @@ const styles = StyleSheet.create({
   warningText: {
     color: COLORS.warning,
     fontSize: 13
+  },
+  inlineAction: {
+    marginTop: 8,
+    alignSelf: 'flex-start',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.panelMuted,
+    paddingHorizontal: 12,
+    paddingVertical: 10
+  },
+  inlineActionText: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontWeight: '600'
   },
   mutedText: {
     color: COLORS.muted,
