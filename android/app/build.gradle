@@ -10,7 +10,7 @@ def assetsDest = new File(projectDir, "src/main/res")
 def cmakePath = { File file -> file.absolutePath.replace('\\', '/') }
 
 android {
-    namespace 'com.wobbmobile'
+    namespace 'com.wobbmobile.wobb'
     compileSdk 35
 
     buildFeatures {
@@ -18,7 +18,7 @@ android {
     }
 
     defaultConfig {
-        applicationId "com.wobbmobile"
+        applicationId "com.wobbmobile.wobb"
         minSdk 31
         targetSdk 35
         versionCode 1
