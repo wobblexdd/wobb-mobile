@@ -30,7 +30,7 @@
             android:exported="false"
             android:foregroundServiceType="specialUse"
             android:icon="@android:drawable/sym_def_app_icon"
-            android:label="Wobb Neural Link - Protected"
+            android:label="Wobb VPN session"
             android:permission="android.permission.BIND_VPN_SERVICE">
             <intent-filter>
                 <action android:name="android.net.VpnService" />

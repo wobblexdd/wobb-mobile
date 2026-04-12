@@ -33,6 +33,12 @@ type ApiError = Error & {
   prompt?: string;
 };
 
+type VpnProvisioningConfig = Record<string, unknown> & {
+  xrayConfig?: Record<string, unknown> | null;
+  stealthXrayConfig?: Record<string, unknown> | null;
+  assignedEndpoint?: string | null;
+};
+
 type SessionData = {
   mode: ConnectionMode;
   state: 'idle' | 'blocked';
@@ -311,28 +317,91 @@ function deriveConnectionState(session: SessionData | null, localState: Connecti
   return localState;
 }
 
+function createApiError(message: string, code?: string, prompt?: string): ApiError {
+  const error = new Error(message) as ApiError;
+  error.code = code;
+  error.prompt = prompt;
+  return error;
+}
+
+function friendlyErrorMessage(error: unknown): string {
+  const apiError = error as ApiError;
+
+  switch (apiError?.code) {
+    case 'auth_error':
+      return 'Google sign-in could not be verified.';
+    case 'backend_unavailable':
+      return 'Backend is unavailable. Check the local API and USB port reverse.';
+    case 'session_transfer_required':
+      return apiError.prompt || 'This account is already active on another device.';
+    case 'xui_unavailable':
+      return 'Provisioning service is unavailable right now.';
+    case 'inbound_missing':
+      return 'No usable VPN inbound is available on the server.';
+    case 'provisioning_failed':
+      return 'VPN provisioning failed on the backend.';
+    case 'invalid_profile':
+      return 'The backend returned an invalid VPN profile.';
+    case 'tunnel_start_failed':
+      return 'The Android tunnel could not start.';
+    default:
+      return error instanceof Error ? error.message : 'Request failed.';
+  }
+}
+
+function extractTunnelConfig(
+  provisioningConfig: SessionData['provisioning']['vpnConfig'],
+  mode: ConnectionMode
+): Record<string, unknown> | null {
+  if (!provisioningConfig || typeof provisioningConfig !== 'object') {
+    return null;
+  }
+
+  const typedConfig = provisioningConfig as VpnProvisioningConfig;
+  if (mode === 'proxy' && typedConfig.stealthXrayConfig && typeof typedConfig.stealthXrayConfig === 'object') {
+    return typedConfig.stealthXrayConfig;
+  }
+
+  if (typedConfig.xrayConfig && typeof typedConfig.xrayConfig === 'object') {
+    return typedConfig.xrayConfig;
+  }
+
+  return null;
+}
+
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   let lastError: unknown;
 
   for (const baseUrl of API_BASE_CANDIDATES) {
     try {
       const response = await fetch(`${baseUrl}${path}`, init);
-      const payload = (await response.json()) as T & { message?: string; code?: string; prompt?: string };
+      const rawBody = await response.text();
+      const payload = rawBody
+        ? (JSON.parse(rawBody) as T & { message?: string; code?: string; prompt?: string })
+        : ({} as T & { message?: string; code?: string; prompt?: string });
 
       if (!response.ok) {
-        const error = new Error(payload.message || `Request failed with status ${response.status}`) as ApiError;
-        error.code = payload.code;
-        error.prompt = payload.prompt;
-        throw error;
+        throw createApiError(
+          payload.message || `Request failed with status ${response.status}`,
+          payload.code,
+          payload.prompt
+        );
       }
 
       return payload;
     } catch (error) {
+      if ((error as ApiError)?.code) {
+        throw error;
+      }
+
       lastError = error;
     }
   }
 
-  throw lastError instanceof Error ? lastError : new Error('API request failed');
+  throw createApiError(
+    lastError instanceof Error ? lastError.message : 'API request failed',
+    'backend_unavailable'
+  );
 }
 
 async function openMobileSession(params: {
@@ -467,6 +536,10 @@ export default function App() {
       appendLog('api', response.data.provisioning.maintenanceReason, 'warn');
     }
 
+    if (response.data.provisioning.assignedEndpoint) {
+      appendLog('api', `Profile ready for ${response.data.provisioning.assignedEndpoint}.`);
+    }
+
     if (response.message === 'Limit Exceeded' || response.data.subscription.blockedReason) {
       setLocalConnectionState('blocked');
     } else if (localConnectionState === 'verifying') {
@@ -566,7 +639,7 @@ export default function App() {
         }
       } catch (error) {
         if (!cancelled) {
-          const message = error instanceof Error ? error.message : 'Failed to initialize app.';
+          const message = friendlyErrorMessage(error);
           setErrorText(message);
           setLocalConnectionState('error');
           appendLog('app', message, 'error');
@@ -605,7 +678,7 @@ export default function App() {
         );
         await applySession(response);
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'Failed to refresh state.';
+        const message = friendlyErrorMessage(error);
         setErrorText(message);
         appendLog('api', message, 'error');
       }
@@ -649,7 +722,7 @@ export default function App() {
       setInstallationId(nextInstallationId);
       appendLog('api', 'Signed in and session created.');
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Sign-in failed.';
+      const message = friendlyErrorMessage(error);
       setErrorText(message);
       setLocalConnectionState('error');
       appendLog('api', message, 'error');
@@ -671,7 +744,7 @@ export default function App() {
       await applySession(response);
       setErrorText(null);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to switch location.';
+      const message = friendlyErrorMessage(error);
       setErrorText(message);
       setLocalConnectionState('error');
       appendLog('api', message, 'error');
@@ -698,16 +771,20 @@ export default function App() {
         return;
       }
 
-      const vpnConfig = session.provisioning.vpnConfig;
-      if (!vpnConfig) {
-        throw new Error('VPN config is unavailable for this account.');
+      const tunnelConfig = extractTunnelConfig(session.provisioning.vpnConfig, session.mode);
+      if (!tunnelConfig) {
+        throw createApiError('The backend returned an invalid VPN profile.', 'invalid_profile');
       }
 
       setLocalConnectionState('connecting');
       await VpnInterface.prepare();
-      await VpnInterface.start(vpnConfig);
+      await VpnInterface.start(tunnelConfig);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'VPN error.';
+      let apiError = error as ApiError;
+      if (!apiError?.code && error instanceof Error) {
+        apiError = createApiError(error.message, 'tunnel_start_failed');
+      }
+      const message = friendlyErrorMessage(apiError);
       setLocalConnectionState('error');
       setErrorText(message);
       appendLog('native', message, 'error');
@@ -739,7 +816,7 @@ export default function App() {
       await applySession(response);
       appendLog('api', 'Session refreshed.');
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to refresh session.';
+      const message = friendlyErrorMessage(error);
       setErrorText(message);
       setLocalConnectionState('error');
       appendLog('api', message, 'error');
@@ -799,7 +876,7 @@ export default function App() {
 
   const connectDisabled =
     !session ||
-    !session.provisioning.vpnConfig ||
+    !extractTunnelConfig(session.provisioning.vpnConfig, session.mode) ||
     effectiveConnectionState === 'verifying' ||
     effectiveConnectionState === 'disconnecting' ||
     effectiveConnectionState === 'blocked';
