@@ -14,18 +14,14 @@ import android.os.ParcelFileDescriptor;
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.IOException;
+
+import libXray.DialerController;
 import libXray.LibXray;
 
-/**
- * Android VPN service shell for Wobb mobile.
- *
- * This service owns the foreground notification, prepares the TUN interface,
- * and forwards a runtime JSON config into an embedded libXray-style Android
- * library. Concrete libXray method signatures vary between wrappers, so the
- * integration entry points are intentionally isolated behind reflection-based
- * placeholder calls.
- */
 public class WobbVpnService extends VpnService {
     public static final String ACTION_START = "com.wobbmobile.wobb.action.START";
     public static final String ACTION_STOP = "com.wobbmobile.wobb.action.STOP";
@@ -115,10 +111,6 @@ public class WobbVpnService extends VpnService {
         manager.createNotificationChannel(channel);
     }
 
-    /**
-     * Prepares the TUN interface and starts the embedded core through the
-     * project-specific Android library wrapper.
-     */
     private synchronized void startTunnel(@Nullable String configJson) {
         stopTunnel();
         WobbVpnEventEmitter.emitVpnStatus("connecting");
@@ -146,7 +138,9 @@ public class WobbVpnService extends VpnService {
         WobbVpnEventEmitter.emitLog("service", "Android VPN interface established.");
 
         try {
-            startEmbeddedCore(configJson == null ? "{}" : configJson, tunInterface.getFd());
+            String runtimeConfig = configJson == null ? "{}" : configJson;
+            logResolvedEndpoint(runtimeConfig);
+            startEmbeddedCore(runtimeConfig, tunInterface.getFd());
             WobbVpnEventEmitter.emitLog("service", "Embedded Wobb Core started.");
             WobbVpnEventEmitter.emitVpnStatus("connected");
         } catch (Exception exception) {
@@ -157,22 +151,82 @@ public class WobbVpnService extends VpnService {
         }
     }
 
-    /**
-     * Placeholder libXray invocation.
-     *
-     * Replace the reflective lookup with your concrete wrapper once the final
-     * `.aar` API surface is fixed. The expected shape is similar to:
-     * `libXray.Xray.startVpn(configString)`.
-     */
+    private void registerDialerController() {
+        DialerController controller = new DialerController() {
+            @Override
+            public boolean protectFd(long fd) {
+                return protect((int) fd);
+            }
+        };
+
+        LibXray.registerDialerController(controller);
+        LibXray.registerListenerController(controller);
+    }
+
+    private void logResolvedEndpoint(String configString) throws Exception {
+        JSONObject root = new JSONObject(configString);
+        JSONArray outbounds = root.optJSONArray("outbounds");
+        if (outbounds == null || outbounds.length() == 0) {
+            throw new IllegalArgumentException("Runtime profile is missing outbounds.");
+        }
+
+        JSONObject proxy = null;
+        for (int index = 0; index < outbounds.length(); index++) {
+            JSONObject candidate = outbounds.optJSONObject(index);
+            if (candidate == null) {
+                continue;
+            }
+
+            if ("proxy".equalsIgnoreCase(candidate.optString("tag"))) {
+                proxy = candidate;
+                break;
+            }
+        }
+
+        if (proxy == null) {
+            proxy = outbounds.optJSONObject(0);
+        }
+
+        if (proxy == null) {
+            throw new IllegalArgumentException("Runtime profile does not include a proxy outbound.");
+        }
+
+        JSONObject settings = proxy.optJSONObject("settings");
+        JSONArray vnext = settings != null ? settings.optJSONArray("vnext") : null;
+        JSONObject server = vnext != null ? vnext.optJSONObject(0) : null;
+        JSONArray users = server != null ? server.optJSONArray("users") : null;
+        JSONObject user = users != null ? users.optJSONObject(0) : null;
+        JSONObject streamSettings = proxy.optJSONObject("streamSettings");
+        JSONObject realitySettings = streamSettings != null ? streamSettings.optJSONObject("realitySettings") : null;
+
+        String address = server != null ? server.optString("address", "") : "";
+        int port = server != null ? server.optInt("port", 0) : 0;
+        String uuid = user != null ? user.optString("id", "") : "";
+        String security = streamSettings != null ? streamSettings.optString("security", "") : "";
+        String serverName = realitySettings != null ? realitySettings.optString("serverName", "") : "";
+        String publicKey = realitySettings != null ? realitySettings.optString("publicKey", "") : "";
+        String shortId = realitySettings != null ? realitySettings.optString("shortId", "") : "";
+
+        if (address.isEmpty() || port < 1 || port > 65535 || uuid.isEmpty()) {
+            throw new IllegalArgumentException("Runtime profile is missing address, port, or client UUID.");
+        }
+
+        if ("reality".equalsIgnoreCase(security)) {
+            if (serverName.isEmpty() || publicKey.isEmpty() || shortId.isEmpty()) {
+                throw new IllegalArgumentException("Runtime profile is missing REALITY fields.");
+            }
+        }
+
+        WobbVpnEventEmitter.emitLog("service", "Runtime endpoint: " + address + ":" + port + " (security=" + security + ")");
+    }
+
     private void startEmbeddedCore(String configString, int tunFd) throws Exception {
+        registerDialerController();
         WobbVpnEventEmitter.emitLog("service", "Calling libXray.LibXray.runXrayFromJSON(...).");
         String result = LibXray.runXrayFromJSON(configString);
         WobbVpnEventEmitter.emitLog("service", "LibXray response: " + result);
     }
 
-    /**
-     * Placeholder libXray shutdown hook.
-     */
     private void stopEmbeddedCore() {
         try {
             WobbVpnEventEmitter.emitLog("service", "Stopping embedded Wobb Core bridge.");
@@ -183,9 +237,6 @@ public class WobbVpnService extends VpnService {
         }
     }
 
-    /**
-     * Stops the embedded core and closes the TUN descriptor.
-     */
     private synchronized void stopTunnel() {
         stopEmbeddedCore();
 

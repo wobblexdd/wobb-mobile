@@ -338,6 +338,8 @@ function friendlyErrorMessage(error: unknown): string {
       return 'Provisioning service is unavailable right now.';
     case 'inbound_missing':
       return 'No usable VPN inbound is available on the server.';
+    case 'bad_inbound_mapping':
+      return 'The selected server inbound is configured incorrectly.';
     case 'provisioning_failed':
       return 'VPN provisioning failed on the backend.';
     case 'invalid_profile':
@@ -349,6 +351,72 @@ function friendlyErrorMessage(error: unknown): string {
   }
 }
 
+function isPlaceholderRuntimeValue(value: unknown): boolean {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    normalized.includes('example.com') ||
+    normalized.includes('replace-with-') ||
+    normalized.includes('your-google-') ||
+    normalized === 'change-me'
+  );
+}
+
+function validateTunnelConfig(config: Record<string, unknown> | null): { valid: boolean; reason?: string; endpoint?: string } {
+  if (!config || typeof config !== 'object') {
+    return {
+      valid: false,
+      reason: 'The backend returned an invalid VPN profile.',
+    };
+  }
+
+  const outbounds = Array.isArray((config as { outbounds?: unknown[] }).outbounds)
+    ? ((config as { outbounds?: unknown[] }).outbounds as Array<Record<string, any>>)
+    : [];
+  const proxy = outbounds.find((entry) => String(entry?.tag || '').toLowerCase() === 'proxy') || outbounds[0];
+  const vnext = Array.isArray(proxy?.settings?.vnext) ? proxy.settings.vnext[0] : null;
+  const user = Array.isArray(vnext?.users) ? vnext.users[0] : null;
+  const streamSettings = proxy?.streamSettings || {};
+  const security = String(streamSettings?.security || '').trim().toLowerCase();
+  const address = String(vnext?.address || '').trim();
+  const port = Number(vnext?.port);
+
+  if (!address || isPlaceholderRuntimeValue(address)) {
+    return { valid: false, reason: 'The backend returned an invalid VPN host.' };
+  }
+
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    return { valid: false, reason: 'The backend returned an invalid VPN port.' };
+  }
+
+  if (!String(user?.id || '').trim()) {
+    return { valid: false, reason: 'The backend returned an empty client UUID.' };
+  }
+
+  if (security === 'reality') {
+    const realitySettings = streamSettings?.realitySettings || {};
+    if (isPlaceholderRuntimeValue(realitySettings?.publicKey) || !String(realitySettings?.publicKey || '').trim()) {
+      return { valid: false, reason: 'The backend returned an invalid REALITY public key.' };
+    }
+
+    if (isPlaceholderRuntimeValue(realitySettings?.shortId) || !String(realitySettings?.shortId || '').trim()) {
+      return { valid: false, reason: 'The backend returned an invalid REALITY short ID.' };
+    }
+
+    if (isPlaceholderRuntimeValue(realitySettings?.serverName) || !String(realitySettings?.serverName || '').trim()) {
+      return { valid: false, reason: 'The backend returned an invalid REALITY server name.' };
+    }
+  }
+
+  return {
+    valid: true,
+    endpoint: `${address}:${port}`,
+  };
+}
+
 function extractTunnelConfig(
   provisioningConfig: SessionData['provisioning']['vpnConfig'],
   mode: ConnectionMode
@@ -358,15 +426,14 @@ function extractTunnelConfig(
   }
 
   const typedConfig = provisioningConfig as VpnProvisioningConfig;
-  if (mode === 'proxy' && typedConfig.stealthXrayConfig && typeof typedConfig.stealthXrayConfig === 'object') {
-    return typedConfig.stealthXrayConfig;
-  }
+  const candidate =
+    mode === 'proxy' && typedConfig.stealthXrayConfig && typeof typedConfig.stealthXrayConfig === 'object'
+      ? typedConfig.stealthXrayConfig
+      : typedConfig.xrayConfig && typeof typedConfig.xrayConfig === 'object'
+        ? typedConfig.xrayConfig
+        : null;
 
-  if (typedConfig.xrayConfig && typeof typedConfig.xrayConfig === 'object') {
-    return typedConfig.xrayConfig;
-  }
-
-  return null;
+  return validateTunnelConfig(candidate).valid ? candidate : null;
 }
 
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
@@ -538,6 +605,16 @@ export default function App() {
 
     if (response.data.provisioning.assignedEndpoint) {
       appendLog('api', `Profile ready for ${response.data.provisioning.assignedEndpoint}.`);
+    }
+
+    const provisioningValidation = validateTunnelConfig(
+      extractTunnelConfig(response.data.provisioning.vpnConfig, response.data.mode)
+    );
+    if (response.data.provisioning.vpnConfig && !provisioningValidation.valid) {
+      setErrorText(provisioningValidation.reason || 'The backend returned an invalid VPN profile.');
+      appendLog('api', provisioningValidation.reason || 'The backend returned an invalid VPN profile.', 'error');
+    } else {
+      setErrorText(null);
     }
 
     if (response.message === 'Limit Exceeded' || response.data.subscription.blockedReason) {
@@ -772,10 +849,12 @@ export default function App() {
       }
 
       const tunnelConfig = extractTunnelConfig(session.provisioning.vpnConfig, session.mode);
-      if (!tunnelConfig) {
-        throw createApiError('The backend returned an invalid VPN profile.', 'invalid_profile');
+      const tunnelValidation = validateTunnelConfig(tunnelConfig);
+      if (!tunnelConfig || !tunnelValidation.valid) {
+        throw createApiError(tunnelValidation.reason || 'The backend returned an invalid VPN profile.', 'invalid_profile');
       }
 
+      appendLog('app', `Starting tunnel to ${tunnelValidation.endpoint || session.provisioning.assignedEndpoint || 'resolved endpoint'}.`);
       setLocalConnectionState('connecting');
       await VpnInterface.prepare();
       await VpnInterface.start(tunnelConfig);
