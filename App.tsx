@@ -20,10 +20,17 @@ import {
   buildTunnelConfig,
   createEmptyBootstrapDraft,
   createEmptyProfile,
+  createProfileSummary,
   createShareLink,
+  duplicateProfile,
   generateUuid,
+  normalizeBootstrapAuthMethod,
   normalizeProfile,
+  parseProfileImport,
   profileEndpoint,
+  sortProfiles,
+  touchProfileUsage,
+  type BootstrapAuthMethod,
   type BootstrapDraft,
   type LocalProfile,
   type ProfileMode,
@@ -32,7 +39,7 @@ import {
 } from './profileUtils';
 
 type ConnectionState = 'idle' | 'permission_required' | 'connecting' | 'connected' | 'disconnecting' | 'error';
-type ViewMode = 'home' | 'form' | 'bootstrap';
+type ViewMode = 'home' | 'form' | 'import' | 'bootstrap' | 'settings';
 
 type DiagnosticLogEntry = {
   id: string;
@@ -56,28 +63,35 @@ type BootstrapPlan = {
   manualSteps?: string[];
   panelTemplate?: Record<string, unknown>;
   shareLink?: string | null;
+  summary?: string | null;
+  commandSnippets?: string[];
 };
 
-const PROFILES_KEY = 'wobb.mobile.selfhosted.profiles.v1';
-const ACTIVE_PROFILE_KEY = 'wobb.mobile.selfhosted.active-profile.v1';
-const ONBOARDING_COMPLETE_KEY = 'wobb.mobile.selfhosted.onboarding.v1';
+const PROFILES_KEY = 'wobb.mobile.selfhosted.profiles.v2';
+const ACTIVE_PROFILE_KEY = 'wobb.mobile.selfhosted.active-profile.v2';
+const ONBOARDING_COMPLETE_KEY = 'wobb.mobile.selfhosted.onboarding.v2';
 const HELPER_API_BASE_CANDIDATES = ['http://127.0.0.1:3000', 'http://10.0.2.2:3000'];
 
 const ONBOARDING_SLIDES: OnboardingSlide[] = [
   {
-    eyebrow: 'Self-hosted access',
-    title: 'Bring your own server',
-    body: 'Use Wobb with your own VLESS and REALITY profile instead of a public hosted plan.',
+    eyebrow: 'Self-hosted first',
+    title: 'Bring your own VLESS server',
+    body: 'Wobb stores your REALITY profiles locally so you can connect without a hosted account layer.',
   },
   {
-    eyebrow: 'Manual profile first',
-    title: 'Save one clean config',
-    body: 'Add your host, UUID, server name, public key, and short ID locally on the device.',
+    eyebrow: 'Import or create',
+    title: 'Keep one clean source of truth',
+    body: 'Paste a VLESS URI, import supported JSON, or enter the profile fields manually and validate them before connect.',
   },
   {
-    eyebrow: 'Optional setup helper',
-    title: 'Bootstrap your VPS',
-    body: 'Generate a setup plan when you want help preparing a new server, then connect with the saved profile.',
+    eyebrow: 'Real runtime state',
+    title: 'See exactly what happened',
+    body: 'Connection status, endpoint, and recent logs stay visible so runtime issues are easy to inspect.',
+  },
+  {
+    eyebrow: 'Bootstrap when needed',
+    title: 'Plan a new VPS setup',
+    body: 'Use the helper service to generate a setup plan, then save the final profile locally on the device.',
   },
 ];
 
@@ -89,21 +103,24 @@ const COLORS = {
   text: '#e5e7eb',
   muted: '#94a3b8',
   accent: '#3b82f6',
-  accentSoft: '#1d4ed8',
   success: '#bfdbfe',
   successSoft: '#172554',
   warning: '#fef08a',
   warningSoft: '#3f3b0b',
   danger: '#fca5a5',
-  dangerSoft: '#3f1d2e'
+  dangerSoft: '#3f1d2e',
+};
+
+type WobbVpnBridge = {
+  prepareVpn?: () => Promise<{ granted?: boolean }>;
+  startVpn?: (configJson: string) => Promise<void>;
+  stopVpn?: () => Promise<void>;
+  setClipboardText?: (text: string) => Promise<boolean>;
+  getClipboardText?: () => Promise<string | null>;
 };
 
 const { WobbVpnModule } = NativeModules as {
-  WobbVpnModule?: {
-    prepareVpn?: () => Promise<{ granted?: boolean }>;
-    startVpn?: (configJson: string) => Promise<void>;
-    stopVpn?: () => Promise<void>;
-  };
+  WobbVpnModule?: WobbVpnBridge;
 };
 
 const VpnInterface = {
@@ -130,7 +147,7 @@ const VpnInterface = {
     }
 
     return WobbVpnModule.stopVpn();
-  }
+  },
 };
 
 function createLogEntry(
@@ -177,6 +194,33 @@ function stateTone(state: ConnectionState) {
   return { text: COLORS.text, background: COLORS.panelMuted };
 }
 
+function formatRelativeTime(timestamp: string | null): string {
+  if (!timestamp) {
+    return 'Never used';
+  }
+
+  const delta = Date.now() - Date.parse(timestamp);
+  if (Number.isNaN(delta) || delta < 0) {
+    return 'Updated';
+  }
+
+  const minutes = Math.floor(delta / 60000);
+  if (minutes < 1) {
+    return 'Used just now';
+  }
+  if (minutes < 60) {
+    return `Used ${minutes}m ago`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `Used ${hours}h ago`;
+  }
+
+  const days = Math.floor(hours / 24);
+  return `Used ${days}d ago`;
+}
+
 async function readProfiles(): Promise<LocalProfile[]> {
   const raw = await storage.getItem(PROFILES_KEY);
   if (!raw) {
@@ -184,15 +228,15 @@ async function readProfiles(): Promise<LocalProfile[]> {
   }
 
   try {
-    const parsed = JSON.parse(raw) as LocalProfile[];
-    return Array.isArray(parsed) ? parsed : [];
+    const parsed = JSON.parse(raw) as Array<Partial<LocalProfile>>;
+    return Array.isArray(parsed) ? sortProfiles(parsed.map((entry) => createEmptyProfile(entry))) : [];
   } catch {
     return [];
   }
 }
 
 async function writeProfiles(profiles: LocalProfile[]): Promise<void> {
-  await storage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+  await storage.setItem(PROFILES_KEY, JSON.stringify(sortProfiles(profiles)));
 }
 
 async function readActiveProfileId(): Promise<string | null> {
@@ -212,8 +256,13 @@ async function readOnboardingComplete(): Promise<boolean> {
   return (await storage.getItem(ONBOARDING_COMPLETE_KEY)) === '1';
 }
 
-async function writeOnboardingComplete(): Promise<void> {
-  await storage.setItem(ONBOARDING_COMPLETE_KEY, '1');
+async function writeOnboardingComplete(value: boolean): Promise<void> {
+  if (value) {
+    await storage.setItem(ONBOARDING_COMPLETE_KEY, '1');
+    return;
+  }
+
+  await storage.removeItem(ONBOARDING_COMPLETE_KEY);
 }
 
 async function helperRequest<T>(path: string, init?: RequestInit): Promise<T> {
@@ -240,6 +289,23 @@ async function helperRequest<T>(path: string, init?: RequestInit): Promise<T> {
 
 function validationText(validation: ValidationResult): string | null {
   return validation.valid ? null : validation.errors[0] || 'Profile is incomplete.';
+}
+
+async function copyText(text: string): Promise<boolean> {
+  if (!WobbVpnModule?.setClipboardText) {
+    return false;
+  }
+
+  await WobbVpnModule.setClipboardText(text);
+  return true;
+}
+
+async function readClipboardText(): Promise<string | null> {
+  if (!WobbVpnModule?.getClipboardText) {
+    return null;
+  }
+
+  return WobbVpnModule.getClipboardText();
 }
 
 function FormField({
@@ -273,29 +339,51 @@ function FormField({
   );
 }
 
-function ModeToggle({
+function SegmentedToggle({
+  options,
   value,
   onChange,
 }: {
-  value: ProfileMode;
-  onChange: (next: ProfileMode) => void;
+  options: Array<{ label: string; value: string }>;
+  value: string;
+  onChange: (next: string) => void;
 }) {
   return (
-    <View style={styles.modeToggle}>
-      {(['vpn', 'proxy'] as ProfileMode[]).map((option) => {
-        const selected = value === option;
+    <View style={styles.segmentedToggle}>
+      {options.map((option) => {
+        const selected = value === option.value;
         return (
           <Pressable
-            key={option}
-            onPress={() => onChange(option)}
-            style={[styles.modeButton, selected && styles.modeButtonActive]}
+            key={option.value}
+            onPress={() => onChange(option.value)}
+            style={[styles.segmentButton, selected && styles.segmentButtonActive]}
           >
-            <Text style={[styles.modeButtonText, selected && styles.modeButtonTextActive]}>
-              {option === 'vpn' ? 'VPN' : 'Proxy'}
-            </Text>
+            <Text style={[styles.segmentButtonText, selected && styles.segmentButtonTextActive]}>{option.label}</Text>
           </Pressable>
         );
       })}
+    </View>
+  );
+}
+
+function EmptyState({
+  title,
+  body,
+  actionLabel,
+  onPress,
+}: {
+  title: string;
+  body: string;
+  actionLabel: string;
+  onPress: () => void;
+}) {
+  return (
+    <View style={styles.emptyState}>
+      <Text style={styles.emptyStateTitle}>{title}</Text>
+      <Text style={styles.emptyStateBody}>{body}</Text>
+      <Pressable style={styles.secondaryButton} onPress={onPress}>
+        <Text style={styles.secondaryButtonText}>{actionLabel}</Text>
+      </Pressable>
     </View>
   );
 }
@@ -308,27 +396,67 @@ export default function App() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
   const [profiles, setProfiles] = useState<LocalProfile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
   const [formDraft, setFormDraft] = useState<LocalProfile>(createEmptyProfile());
   const [editingProfileId, setEditingProfileId] = useState<string | null>(null);
+  const [importText, setImportText] = useState('');
   const [bootstrapDraft, setBootstrapDraft] = useState<BootstrapDraft>(createEmptyBootstrapDraft());
   const [bootstrapPlan, setBootstrapPlan] = useState<BootstrapPlan | null>(null);
   const [bootstrapBusy, setBootstrapBusy] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [logs, setLogs] = useState<DiagnosticLogEntry[]>([]);
-  const logViewportRef = useRef<ScrollView | null>(null);
+  const activeProfileIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    activeProfileIdRef.current = activeProfileId;
+  }, [activeProfileId]);
 
   const activeProfile = useMemo(
     () => profiles.find((profile) => profile.id === activeProfileId) || null,
     [profiles, activeProfileId]
   );
   const activeValidation = useMemo(
-    () => (activeProfile ? validateProfile(activeProfile) : { valid: false, errors: ['Add a profile to connect.'] }),
+    () => (activeProfile ? validateProfile(activeProfile) : { valid: false, errors: ['Add a profile to connect.'], fieldErrors: {} }),
     [activeProfile]
   );
   const tone = stateTone(connectionState);
+  const filteredProfiles = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) {
+      return sortProfiles(profiles);
+    }
+
+    return sortProfiles(profiles).filter((profile) => {
+      const haystack = [profile.name, profile.host, profile.serverName, profile.remarks].filter(Boolean).join(' ').toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [profiles, searchQuery]);
 
   function appendLog(source: DiagnosticLogEntry['source'], message: string, level: DiagnosticLogEntry['level'] = 'info') {
-    setLogs((current) => [...current, createLogEntry(source, message, level)].slice(-150));
+    setLogs((current) => [...current, createLogEntry(source, message, level)].slice(-200));
+  }
+
+  async function persistProfiles(nextProfiles: LocalProfile[], nextActiveProfileId: string | null) {
+    const sorted = sortProfiles(nextProfiles.map((profile) => createEmptyProfile(profile)));
+    setProfiles(sorted);
+    setActiveProfileId(nextActiveProfileId);
+    await writeProfiles(sorted);
+    await writeActiveProfileId(nextActiveProfileId);
+  }
+
+  function updateProfileMetadata(result: string) {
+    const targetId = activeProfileIdRef.current;
+    if (!targetId) {
+      return;
+    }
+
+    setProfiles((current) => {
+      const next = sortProfiles(
+        current.map((profile) => (profile.id === targetId ? touchProfileUsage(profile, result) : profile))
+      );
+      void writeProfiles(next);
+      return next;
+    });
   }
 
   useEffect(() => {
@@ -341,12 +469,15 @@ export default function App() {
         appendLog('native', 'VPN service is starting.');
       } else if (status === 'connected') {
         setConnectionState('connected');
+        setErrorText(null);
+        updateProfileMetadata('connected');
         appendLog('native', 'VPN tunnel connected.');
       } else if (status === 'disconnecting') {
         setConnectionState('disconnecting');
         appendLog('native', 'VPN service is stopping.');
       } else if (status === 'error') {
         setConnectionState('error');
+        updateProfileMetadata('error');
         appendLog('native', 'VPN service reported an error.', 'error');
       } else if (status === 'stopped' || status === 'idle') {
         setConnectionState('idle');
@@ -369,6 +500,7 @@ export default function App() {
       if (status === 'denied') {
         setConnectionState('error');
         setErrorText('VPN permission was denied.');
+        updateProfileMetadata('permission_denied');
         appendLog('native', 'VPN permission was denied.', 'error');
       }
     });
@@ -385,8 +517,13 @@ export default function App() {
           return;
         }
 
-        setProfiles(storedProfiles);
-        setActiveProfileId(storedActiveProfileId || storedProfiles[0]?.id || null);
+        const nextProfiles = sortProfiles(storedProfiles);
+        const nextActiveId = nextProfiles.some((profile) => profile.id === storedActiveProfileId)
+          ? storedActiveProfileId
+          : nextProfiles[0]?.id || null;
+
+        setProfiles(nextProfiles);
+        setActiveProfileId(nextActiveId);
         setOnboardingComplete(storedOnboarding);
       } finally {
         if (!cancelled) {
@@ -405,19 +542,8 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    logViewportRef.current?.scrollToEnd({ animated: true });
-  }, [logs]);
-
-  async function persistProfiles(nextProfiles: LocalProfile[], nextActiveProfileId: string | null) {
-    setProfiles(nextProfiles);
-    setActiveProfileId(nextActiveProfileId);
-    await writeProfiles(nextProfiles);
-    await writeActiveProfileId(nextActiveProfileId);
-  }
-
-  function handleCompleteOnboarding() {
-    writeOnboardingComplete().catch(() => undefined);
+  async function handleCompleteOnboarding() {
+    await writeOnboardingComplete(true);
     setOnboardingComplete(true);
   }
 
@@ -430,7 +556,7 @@ export default function App() {
 
   function handleOpenEditProfile(profile: LocalProfile) {
     setEditingProfileId(profile.id);
-    setFormDraft(profile);
+    setFormDraft(createEmptyProfile(profile));
     setErrorText(null);
     setViewMode('form');
   }
@@ -441,9 +567,9 @@ export default function App() {
       const nextProfiles = editingProfileId
         ? profiles.map((profile) => (profile.id === editingProfileId ? savedProfile : profile))
         : [savedProfile, ...profiles];
-      const nextActiveId = activeProfileId || savedProfile.id;
+      const nextActiveId = editingProfileId === activeProfileId ? savedProfile.id : activeProfileId || savedProfile.id;
 
-      await persistProfiles(nextProfiles, nextActiveId === editingProfileId ? savedProfile.id : nextActiveId);
+      await persistProfiles(nextProfiles, nextActiveId);
       setViewMode('home');
       setEditingProfileId(null);
       setErrorText(null);
@@ -473,8 +599,23 @@ export default function App() {
     ]);
   }
 
+  async function handleDuplicateProfile(profile: LocalProfile) {
+    const duplicate = duplicateProfile(profile);
+    await persistProfiles([duplicate, ...profiles], duplicate.id);
+    setViewMode('home');
+    appendLog('app', `Duplicated profile ${profile.name}.`);
+  }
+
+  async function handleToggleFavorite(profile: LocalProfile) {
+    const nextProfiles = profiles.map((entry) =>
+      entry.id === profile.id ? createEmptyProfile({ ...entry, isFavorite: !entry.isFavorite, updatedAt: new Date().toISOString() }) : entry
+    );
+    await persistProfiles(nextProfiles, activeProfileId);
+  }
+
   async function handleSelectProfile(profile: LocalProfile) {
     setActiveProfileId(profile.id);
+    activeProfileIdRef.current = profile.id;
     await writeActiveProfileId(profile.id);
     appendLog('app', `Selected profile ${profile.name}.`);
   }
@@ -486,43 +627,86 @@ export default function App() {
     }
 
     try {
-      const shareLink = createShareLink(activeProfile);
-      await Share.share({ message: shareLink });
+      const message = `${createProfileSummary(activeProfile)}\n\n${createShareLink(activeProfile)}`;
+      await Share.share({ message });
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : 'Failed to share profile.');
     }
   }
 
-  async function handleToggleConnection() {
-    setErrorText(null);
+  async function handleCopyProfileUri() {
+    if (!activeProfile) {
+      setErrorText('Select a profile first.');
+      return;
+    }
 
     try {
-      if (connectionState === 'connected' || connectionState === 'connecting') {
-        setConnectionState('disconnecting');
-        appendLog('app', 'Stopping VPN tunnel.');
-        await VpnInterface.stop();
-        setConnectionState('idle');
+      const shareLink = createShareLink(activeProfile);
+      const copied = await copyText(shareLink);
+      if (copied) {
+        setErrorText(null);
+        appendLog('app', 'Profile URI copied to clipboard.');
         return;
       }
 
-      if (!activeProfile) {
-        throw new Error('Add and select a profile before connecting.');
-      }
-
-      const validation = validateProfile(activeProfile);
-      if (!validation.valid) {
-        throw new Error(validation.errors[0]);
-      }
-
-      const config = buildTunnelConfig(activeProfile, activeProfile.mode === 'proxy');
-      setConnectionState('connecting');
-      appendLog('app', `Starting tunnel to ${profileEndpoint(activeProfile)}.`);
-      await VpnInterface.prepare();
-      await VpnInterface.start(config);
+      await Share.share({ message: shareLink });
     } catch (error) {
-      setConnectionState('error');
-      setErrorText(error instanceof Error ? error.message : 'Connection failed.');
-      appendLog('app', error instanceof Error ? error.message : 'Connection failed.', 'error');
+      setErrorText(error instanceof Error ? error.message : 'Failed to copy profile URI.');
+    }
+  }
+
+  async function handleCopyLogs() {
+    if (logs.length === 0) {
+      setErrorText('No logs to copy.');
+      return;
+    }
+
+    const payload = logs
+      .map((entry) => `[${entry.timestamp}] ${entry.source.toUpperCase()} ${entry.level.toUpperCase()} ${entry.message}`)
+      .join('\n');
+
+    try {
+      const copied = await copyText(payload);
+      if (copied) {
+        appendLog('app', 'Logs copied to clipboard.');
+        return;
+      }
+
+      await Share.share({ message: payload });
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : 'Failed to export logs.');
+    }
+  }
+
+  function handleClearLogs() {
+    setLogs([]);
+    setErrorText(null);
+  }
+
+  async function handleImportClipboard() {
+    try {
+      const clipboard = await readClipboardText();
+      if (!clipboard) {
+        throw new Error('Clipboard is empty.');
+      }
+
+      setImportText(clipboard);
+      appendLog('app', 'Pasted profile input from clipboard.');
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : 'Failed to read clipboard.');
+    }
+  }
+
+  function handleImportText() {
+    try {
+      const imported = parseProfileImport(importText);
+      setEditingProfileId(null);
+      setFormDraft(imported);
+      setViewMode('form');
+      setErrorText(null);
+      appendLog('app', `Imported draft for ${imported.name}.`);
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : 'Failed to import profile.');
     }
   }
 
@@ -548,6 +732,7 @@ export default function App() {
           sshHost: bootstrapDraft.sshHost,
           sshPort: bootstrapDraft.sshPort,
           sshUser: bootstrapDraft.sshUser,
+          authMethod: bootstrapDraft.authMethod,
           uuid: bootstrapDraft.uuid || undefined,
           publicKey: bootstrapDraft.publicKey || undefined,
           shortId: bootstrapDraft.shortId || undefined,
@@ -584,6 +769,40 @@ export default function App() {
     setViewMode('form');
   }
 
+  async function handleToggleConnection() {
+    setErrorText(null);
+
+    try {
+      if (connectionState === 'connected' || connectionState === 'connecting') {
+        setConnectionState('disconnecting');
+        appendLog('app', 'Stopping VPN tunnel.');
+        await VpnInterface.stop();
+        setConnectionState('idle');
+        return;
+      }
+
+      if (!activeProfile) {
+        throw new Error('Add and select a profile before connecting.');
+      }
+
+      const validation = validateProfile(activeProfile);
+      if (!validation.valid) {
+        throw new Error(validation.errors[0]);
+      }
+
+      const config = buildTunnelConfig(activeProfile, activeProfile.mode === 'proxy');
+      setConnectionState('connecting');
+      appendLog('app', `Starting tunnel to ${profileEndpoint(activeProfile)}.`);
+      await VpnInterface.prepare();
+      await VpnInterface.start(config);
+    } catch (error) {
+      setConnectionState('error');
+      setErrorText(error instanceof Error ? error.message : 'Connection failed.');
+      updateProfileMetadata('error');
+      appendLog('app', error instanceof Error ? error.message : 'Connection failed.', 'error');
+    }
+  }
+
   const connectLabel =
     connectionState === 'connected'
       ? 'Disconnect'
@@ -611,6 +830,8 @@ export default function App() {
 
   if (!onboardingComplete) {
     const currentSlide = ONBOARDING_SLIDES[Math.min(onboardingStep, ONBOARDING_SLIDES.length - 1)];
+    const finalStep = onboardingStep >= ONBOARDING_SLIDES.length - 1;
+
     return (
       <SafeAreaView style={styles.root}>
         <StatusBar barStyle="light-content" backgroundColor={COLORS.background} />
@@ -623,29 +844,31 @@ export default function App() {
             <Text style={styles.onboardingTitle}>{currentSlide.title}</Text>
             <Text style={styles.onboardingBody}>{currentSlide.body}</Text>
           </View>
-          <View style={styles.panel}>
+
+          <View style={styles.onboardingFooter}>
             <View style={styles.onboardingDots}>
-              {ONBOARDING_SLIDES.map((_, index) => (
-                <View key={index} style={[styles.onboardingDot, index === onboardingStep && styles.onboardingDotActive]} />
+              {ONBOARDING_SLIDES.map((slide, index) => (
+                <View
+                  key={slide.title}
+                  style={[styles.onboardingDot, index === onboardingStep && styles.onboardingDotActive]}
+                />
               ))}
             </View>
             <View style={styles.onboardingActions}>
-              <Pressable style={styles.secondaryButton} onPress={handleCompleteOnboarding}>
+              <Pressable style={[styles.secondaryButton, styles.flexButton]} onPress={() => handleCompleteOnboarding().catch(() => undefined)}>
                 <Text style={styles.secondaryButtonText}>Skip</Text>
               </Pressable>
               <Pressable
                 style={[styles.primaryButton, styles.flexButton]}
                 onPress={() => {
-                  if (onboardingStep === ONBOARDING_SLIDES.length - 1) {
-                    handleCompleteOnboarding();
-                    return;
+                  if (finalStep) {
+                    handleCompleteOnboarding().catch(() => undefined);
+                  } else {
+                    setOnboardingStep((current) => current + 1);
                   }
-                  setOnboardingStep((current) => current + 1);
                 }}
               >
-                <Text style={styles.primaryButtonText}>
-                  {onboardingStep === ONBOARDING_SLIDES.length - 1 ? 'Continue' : 'Next'}
-                </Text>
+                <Text style={styles.primaryButtonText}>{finalStep ? 'Start' : 'Continue'}</Text>
               </Pressable>
             </View>
           </View>
@@ -656,6 +879,7 @@ export default function App() {
 
   if (viewMode === 'form') {
     const draftValidation = validateProfile(formDraft);
+
     return (
       <SafeAreaView style={styles.root}>
         <StatusBar barStyle="light-content" backgroundColor={COLORS.background} />
@@ -668,9 +892,10 @@ export default function App() {
           </View>
 
           <View style={styles.panel}>
-            <Text style={styles.panelTitle}>Connection profile</Text>
-            <FormField label="Profile name" value={formDraft.name} onChangeText={(value) => setFormDraft((current) => ({ ...current, name: value }))} />
-            <FormField label="Host" value={formDraft.host} onChangeText={(value) => setFormDraft((current) => ({ ...current, host: value }))} placeholder="157.90.116.123" />
+            <Text style={styles.panelTitle}>Manual profile</Text>
+            <Text style={styles.panelText}>Enter the VLESS and REALITY details exactly as your server expects them.</Text>
+            <FormField label="Profile name" value={formDraft.name} onChangeText={(value) => setFormDraft((current) => ({ ...current, name: value }))} placeholder="My VPS" />
+            <FormField label="Server host" value={formDraft.host} onChangeText={(value) => setFormDraft((current) => ({ ...current, host: value }))} placeholder="157.90.116.123" />
             <FormField label="Port" value={formDraft.port} onChangeText={(value) => setFormDraft((current) => ({ ...current, port: value }))} keyboardType="numeric" />
             <FormField label="UUID" value={formDraft.uuid} onChangeText={(value) => setFormDraft((current) => ({ ...current, uuid: value }))} />
             <Pressable style={styles.inlineAction} onPress={() => setFormDraft((current) => ({ ...current, uuid: generateUuid() }))}>
@@ -685,12 +910,84 @@ export default function App() {
             <FormField label="Remarks" value={formDraft.remarks} onChangeText={(value) => setFormDraft((current) => ({ ...current, remarks: value }))} multiline />
             <View style={styles.fieldGroup}>
               <Text style={styles.fieldLabel}>Mode</Text>
-              <ModeToggle value={formDraft.mode} onChange={(mode) => setFormDraft((current) => ({ ...current, mode }))} />
+              <SegmentedToggle
+                value={formDraft.mode}
+                onChange={(next) => setFormDraft((current) => ({ ...current, mode: next as ProfileMode }))}
+                options={[
+                  { label: 'VPN', value: 'vpn' },
+                  { label: 'Proxy', value: 'proxy' },
+                ]}
+              />
             </View>
             {draftValidation.valid ? null : <Text style={styles.warningText}>{validationText(draftValidation)}</Text>}
-            <Pressable style={styles.primaryButton} onPress={handleSaveProfile}>
-              <Text style={styles.primaryButtonText}>Save profile</Text>
+            <View style={styles.buttonRow}>
+              <Pressable style={[styles.primaryButton, styles.flexButton]} onPress={handleSaveProfile}>
+                <Text style={styles.primaryButtonText}>{editingProfileId ? 'Save changes' : 'Save profile'}</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.secondaryButton, styles.flexButton]}
+                onPress={() => {
+                  setEditingProfileId(null);
+                  setFormDraft(createEmptyProfile());
+                  setErrorText(null);
+                }}
+              >
+                <Text style={styles.secondaryButtonText}>Reset</Text>
+              </Pressable>
+            </View>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (viewMode === 'import') {
+    return (
+      <SafeAreaView style={styles.root}>
+        <StatusBar barStyle="light-content" backgroundColor={COLORS.background} />
+        <ScrollView contentContainerStyle={styles.scrollContent}>
+          <View style={styles.headerRow}>
+            <Text style={styles.screenTitle}>Import profile</Text>
+            <Pressable style={styles.secondaryButtonCompact} onPress={() => setViewMode('home')}>
+              <Text style={styles.secondaryButtonText}>Back</Text>
             </Pressable>
+          </View>
+
+          <View style={styles.panel}>
+            <Text style={styles.panelTitle}>Paste VLESS URI or JSON</Text>
+            <Text style={styles.panelText}>Import a VLESS REALITY share link, a profile JSON object, or a config with a VLESS outbound.</Text>
+            <TextInput
+              value={importText}
+              onChangeText={setImportText}
+              placeholder="vless://..."
+              placeholderTextColor={COLORS.muted}
+              multiline
+              style={[styles.input, styles.importInput]}
+            />
+            <View style={styles.buttonRow}>
+              <Pressable style={[styles.secondaryButton, styles.flexButton]} onPress={handleImportClipboard}>
+                <Text style={styles.secondaryButtonText}>Paste clipboard</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.secondaryButton, styles.flexButton]}
+                onPress={() => {
+                  setErrorText(null);
+                  appendLog('app', 'QR import is reserved for the camera pass.');
+                }}
+              >
+                <Text style={styles.secondaryButtonText}>QR import</Text>
+              </Pressable>
+              <Pressable style={[styles.primaryButton, styles.flexButton]} onPress={handleImportText}>
+                <Text style={styles.primaryButtonText}>Import draft</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <View style={styles.panel}>
+            <Text style={styles.panelTitle}>Quick notes</Text>
+            <Text style={styles.stepText}>1. QR import can be added later without changing the profile model.</Text>
+            <Text style={styles.stepText}>2. Imported profiles are opened as editable drafts before they are saved.</Text>
+            <Text style={styles.stepText}>3. Placeholder or incomplete values are rejected before connect.</Text>
           </View>
         </ScrollView>
       </SafeAreaView>
@@ -720,9 +1017,21 @@ export default function App() {
             <FormField label="SSH host" value={bootstrapDraft.sshHost} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, sshHost: value }))} />
             <FormField label="SSH port" value={bootstrapDraft.sshPort} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, sshPort: value }))} keyboardType="numeric" />
             <FormField label="SSH user" value={bootstrapDraft.sshUser} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, sshUser: value }))} />
+            <View style={styles.fieldGroup}>
+              <Text style={styles.fieldLabel}>SSH auth</Text>
+              <SegmentedToggle
+                value={bootstrapDraft.authMethod}
+                onChange={(next) => setBootstrapDraft((current) => ({ ...current, authMethod: normalizeBootstrapAuthMethod(next) as BootstrapAuthMethod }))}
+                options={[
+                  { label: 'Private key', value: 'private_key' },
+                  { label: 'Password', value: 'password' },
+                ]}
+              />
+            </View>
             <FormField label="UUID (optional)" value={bootstrapDraft.uuid} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, uuid: value }))} />
             <FormField label="Public key (optional)" value={bootstrapDraft.publicKey} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, publicKey: value }))} />
             <FormField label="Short ID (optional)" value={bootstrapDraft.shortId} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, shortId: value }))} />
+            <FormField label="Remarks" value={bootstrapDraft.remarks} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, remarks: value }))} multiline />
             <Pressable style={styles.primaryButton} onPress={handleRequestBootstrapPlan}>
               <Text style={styles.primaryButtonText}>{bootstrapBusy ? 'Working' : 'Generate setup plan'}</Text>
             </Pressable>
@@ -738,6 +1047,9 @@ export default function App() {
               {bootstrapPlan.manualSteps?.map((step, index) => (
                 <Text key={`${step}-${index}`} style={styles.stepText}>{index + 1}. {step}</Text>
               ))}
+              {bootstrapPlan.commandSnippets?.length ? (
+                <Text style={styles.panelText}>Generated commands: {bootstrapPlan.commandSnippets.length}</Text>
+              ) : null}
               <Pressable style={styles.secondaryButton} onPress={handleUseBootstrapDraft}>
                 <Text style={styles.secondaryButtonText}>
                   {bootstrapPlan.profileReady ? 'Import ready profile' : 'Open draft profile'}
@@ -750,16 +1062,59 @@ export default function App() {
     );
   }
 
+  if (viewMode === 'settings') {
+    return (
+      <SafeAreaView style={styles.root}>
+        <StatusBar barStyle="light-content" backgroundColor={COLORS.background} />
+        <ScrollView contentContainerStyle={styles.scrollContent}>
+          <View style={styles.headerRow}>
+            <Text style={styles.screenTitle}>Settings</Text>
+            <Pressable style={styles.secondaryButtonCompact} onPress={() => setViewMode('home')}>
+              <Text style={styles.secondaryButtonText}>Back</Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.panel}>
+            <Text style={styles.panelTitle}>App state</Text>
+            <Text style={styles.detailValue}>Profiles saved: {profiles.length}</Text>
+            <Text style={styles.detailValue}>Selected profile: {activeProfile?.name || 'None'}</Text>
+            <Text style={styles.detailValue}>Helper API: {HELPER_API_BASE_CANDIDATES.join(' | ')}</Text>
+            <Text style={styles.panelText}>The helper service is optional and is only used for bootstrap planning.</Text>
+          </View>
+
+          <View style={styles.panel}>
+            <Text style={styles.panelTitle}>Developer actions</Text>
+            <View style={styles.buttonRow}>
+              <Pressable
+                style={[styles.secondaryButton, styles.flexButton]}
+                onPress={() => {
+                  writeOnboardingComplete(false).catch(() => undefined);
+                  setOnboardingComplete(false);
+                  setOnboardingStep(0);
+                }}
+              >
+                <Text style={styles.secondaryButtonText}>Replay onboarding</Text>
+              </Pressable>
+              <Pressable style={[styles.secondaryButton, styles.flexButton]} onPress={handleClearLogs}>
+                <Text style={styles.secondaryButtonText}>Clear logs</Text>
+              </Pressable>
+            </View>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.root}>
       <StatusBar barStyle="light-content" backgroundColor={COLORS.background} />
-      <ScrollView contentContainerStyle={styles.scrollContent} ref={logViewportRef}>
+      <ScrollView contentContainerStyle={styles.scrollContent}>
         <View style={styles.header}>
           <View style={styles.headerCopy}>
             <Text style={styles.screenTitle}>Wobb</Text>
             <Text style={styles.screenSubtitle}>Self-hosted VLESS and REALITY client</Text>
           </View>
-          <View style={[styles.stateBadge, { backgroundColor: tone.background }]}>
+          <View style={[styles.stateBadge, { backgroundColor: tone.background }]}> 
             <Text style={[styles.stateBadgeText, { color: tone.text }]}>{stateLabel(connectionState)}</Text>
           </View>
         </View>
@@ -769,7 +1124,7 @@ export default function App() {
             <Text style={styles.sectionLabel}>Active profile</Text>
             <Text style={styles.connectionTitle}>{activeProfile ? activeProfile.name : 'No profile selected'}</Text>
             <Text style={styles.connectionSubtitle}>
-              {activeProfile ? `${profileEndpoint(activeProfile)} - ${activeProfile.serverName}` : 'Add a local server profile to start.'}
+              {activeProfile ? `${profileEndpoint(activeProfile)} | ${activeProfile.serverName}` : 'Create or import a local profile to start.'}
             </Text>
           </View>
 
@@ -794,45 +1149,82 @@ export default function App() {
             <Text style={styles.summaryLabel}>Endpoint</Text>
             <Text style={styles.summaryValue}>{activeProfile ? profileEndpoint(activeProfile) : '--'}</Text>
           </View>
+          <View style={styles.summaryChip}>
+            <Text style={styles.summaryLabel}>Recent</Text>
+            <Text style={styles.summaryValue}>{activeProfile?.lastConnectionResult || '--'}</Text>
+          </View>
         </View>
 
         {!activeValidation.valid && activeProfile ? <Text style={styles.warningText}>{validationText(activeValidation)}</Text> : null}
 
-        <View style={styles.quickActions}>
+        <View style={styles.quickActionsWrap}>
           <Pressable style={styles.quickActionButton} onPress={handleOpenCreateProfile}>
-            <Text style={styles.quickActionLabel}>Add Profile</Text>
+            <Text style={styles.quickActionLabel}>Add</Text>
+          </Pressable>
+          <Pressable style={styles.quickActionButton} onPress={() => setViewMode('import')}>
+            <Text style={styles.quickActionLabel}>Import</Text>
           </Pressable>
           <Pressable style={styles.quickActionButton} onPress={() => setViewMode('bootstrap')}>
             <Text style={styles.quickActionLabel}>Bootstrap</Text>
           </Pressable>
-          <Pressable style={styles.quickActionButton} onPress={handleShareProfile}>
-            <Text style={styles.quickActionLabel}>Share</Text>
+          <Pressable style={styles.quickActionButton} onPress={handleCopyProfileUri}>
+            <Text style={styles.quickActionLabel}>Copy URI</Text>
           </Pressable>
         </View>
 
         <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Profiles</Text>
-          {profiles.length === 0 ? (
-            <Text style={styles.logEmpty}>No local profiles yet.</Text>
+          <View style={styles.panelHeader}>
+            <Text style={styles.panelTitle}>Profiles</Text>
+            <Pressable style={styles.secondaryButtonCompact} onPress={() => setViewMode('settings')}>
+              <Text style={styles.secondaryButtonText}>Settings</Text>
+            </Pressable>
+          </View>
+          <TextInput
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            placeholder="Search profiles"
+            placeholderTextColor={COLORS.muted}
+            style={styles.input}
+          />
+          {filteredProfiles.length === 0 ? (
+            <EmptyState
+              title="No saved profiles"
+              body="Create a profile manually or import a VLESS URI to start connecting from this device."
+              actionLabel="Open import"
+              onPress={() => setViewMode('import')}
+            />
           ) : (
-            profiles.map((profile, index) => {
+            filteredProfiles.map((profile, index) => {
               const selected = profile.id === activeProfileId;
               return (
                 <View key={profile.id}>
                   {index > 0 ? <View style={styles.locationSeparator} /> : null}
                   <View style={[styles.locationRow, selected && styles.locationRowSelected]}>
-                    <View style={styles.locationPrimary}>
-                      <View>
+                    <View style={styles.locationHeader}>
+                      <View style={styles.locationTitleWrap}>
                         <Text style={styles.locationTitle}>{profile.name}</Text>
-                        <Text style={styles.locationSubtitle}>{profile.host}:{profile.port} - {profile.serverName}</Text>
+                        <Text style={styles.locationSubtitle}>{profile.host}:{profile.port} | {profile.serverName}</Text>
                       </View>
+                      <Pressable style={styles.favoriteButton} onPress={() => handleToggleFavorite(profile)}>
+                        <Text style={[styles.favoriteButtonText, profile.isFavorite && styles.favoriteButtonTextActive]}>
+                          {profile.isFavorite ? 'Fav' : 'Star'}
+                        </Text>
+                      </Pressable>
                     </View>
-                    <View style={styles.rowActions}>
+                    <View style={styles.metaRow}>
+                      <Text style={styles.metaChip}>{profile.mode === 'vpn' ? 'VPN' : 'Proxy'}</Text>
+                      <Text style={styles.metaChip}>{profile.lastConnectionResult || 'Not connected yet'}</Text>
+                      <Text style={styles.metaChip}>{formatRelativeTime(profile.lastUsedAt)}</Text>
+                    </View>
+                    <View style={styles.rowActionsWrap}>
                       <Pressable style={styles.rowAction} onPress={() => handleSelectProfile(profile)}>
                         <Text style={styles.rowActionText}>{selected ? 'Active' : 'Use'}</Text>
                       </Pressable>
                       <Pressable style={styles.rowAction} onPress={() => handleOpenEditProfile(profile)}>
                         <Text style={styles.rowActionText}>Edit</Text>
+                      </Pressable>
+                      <Pressable style={styles.rowAction} onPress={() => handleDuplicateProfile(profile)}>
+                        <Text style={styles.rowActionText}>Duplicate</Text>
                       </Pressable>
                       <Pressable style={styles.rowActionDanger} onPress={() => handleDeleteProfile(profile)}>
                         <Text style={styles.rowActionDangerText}>Delete</Text>
@@ -846,7 +1238,17 @@ export default function App() {
         </View>
 
         <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Logs</Text>
+          <View style={styles.panelHeader}>
+            <Text style={styles.panelTitle}>Logs</Text>
+            <View style={styles.inlineButtonRow}>
+              <Pressable style={styles.secondaryButtonCompact} onPress={handleCopyLogs}>
+                <Text style={styles.secondaryButtonText}>Copy</Text>
+              </Pressable>
+              <Pressable style={styles.secondaryButtonCompact} onPress={handleClearLogs}>
+                <Text style={styles.secondaryButtonText}>Clear</Text>
+              </Pressable>
+            </View>
+          </View>
           <View style={styles.logContainer}>
             {logs.length === 0 ? (
               <Text style={styles.logEmpty}>No logs yet.</Text>
@@ -859,6 +1261,15 @@ export default function App() {
               ))
             )}
           </View>
+        </View>
+
+        <View style={styles.buttonRow}>
+          <Pressable style={[styles.secondaryButton, styles.flexButton]} onPress={handleShareProfile}>
+            <Text style={styles.secondaryButtonText}>Share active profile</Text>
+          </Pressable>
+          <Pressable style={[styles.secondaryButton, styles.flexButton]} onPress={() => setViewMode('settings')}>
+            <Text style={styles.secondaryButtonText}>App settings</Text>
+          </Pressable>
         </View>
 
         {errorText ? <Text style={styles.errorText}>{errorText}</Text> : null}
@@ -929,6 +1340,9 @@ const styles = StyleSheet.create({
     marginTop: 16,
     maxWidth: 320,
   },
+  onboardingFooter: {
+    gap: 18,
+  },
   onboardingDots: {
     flexDirection: 'row',
     gap: 8,
@@ -961,6 +1375,12 @@ const styles = StyleSheet.create({
   },
   headerCopy: {
     flex: 1,
+  },
+  panelHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
   },
   screenTitle: {
     color: COLORS.text,
@@ -1064,12 +1484,14 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
   },
-  quickActions: {
+  quickActionsWrap: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 10,
   },
   quickActionButton: {
-    flex: 1,
+    flexGrow: 1,
+    minWidth: '22%',
     borderRadius: 8,
     borderWidth: 1,
     borderColor: COLORS.border,
@@ -1077,6 +1499,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 11,
+    paddingHorizontal: 10,
   },
   quickActionLabel: {
     color: COLORS.text,
@@ -1120,6 +1543,14 @@ const styles = StyleSheet.create({
   flexButton: {
     flex: 1,
   },
+  buttonRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  inlineButtonRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
   fieldGroup: {
     gap: 8,
   },
@@ -1142,7 +1573,11 @@ const styles = StyleSheet.create({
     minHeight: 88,
     textAlignVertical: 'top',
   },
-  modeToggle: {
+  importInput: {
+    minHeight: 180,
+    textAlignVertical: 'top',
+  },
+  segmentedToggle: {
     flexDirection: 'row',
     borderRadius: 8,
     borderWidth: 1,
@@ -1150,21 +1585,55 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.panelMuted,
     overflow: 'hidden',
   },
-  modeButton: {
+  segmentButton: {
     flex: 1,
     paddingVertical: 12,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  modeButtonActive: {
+  segmentButtonActive: {
     backgroundColor: COLORS.accent,
   },
-  modeButtonText: {
+  segmentButtonText: {
     color: COLORS.muted,
     fontWeight: '600',
+    fontSize: 13,
   },
-  modeButtonTextActive: {
+  segmentButtonTextActive: {
     color: '#FFFFFF',
+  },
+  inlineAction: {
+    alignSelf: 'flex-start',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.panelMuted,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  inlineActionText: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  emptyState: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: COLORS.border,
+    padding: 16,
+    gap: 10,
+    alignItems: 'flex-start',
+  },
+  emptyStateTitle: {
+    color: COLORS.text,
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  emptyStateBody: {
+    color: COLORS.muted,
+    fontSize: 14,
+    lineHeight: 20,
   },
   locationSeparator: {
     height: 10,
@@ -1181,10 +1650,13 @@ const styles = StyleSheet.create({
     borderColor: COLORS.accent,
     backgroundColor: '#11213f',
   },
-  locationPrimary: {
+  locationHeader: {
     flexDirection: 'row',
-    alignItems: 'center',
     justifyContent: 'space-between',
+    gap: 12,
+  },
+  locationTitleWrap: {
+    flex: 1,
   },
   locationTitle: {
     color: COLORS.text,
@@ -1196,16 +1668,50 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 4,
   },
-  rowActions: {
+  favoriteButton: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.panel,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  favoriteButtonText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  favoriteButtonTextActive: {
+    color: COLORS.success,
+  },
+  metaRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  metaChip: {
+    color: COLORS.muted,
+    fontSize: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.panel,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    overflow: 'hidden',
+  },
+  rowActionsWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 8,
   },
   rowAction: {
-    flex: 1,
+    flexGrow: 1,
     borderRadius: 8,
     borderWidth: 1,
     borderColor: COLORS.border,
     paddingVertical: 10,
+    paddingHorizontal: 12,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: COLORS.panel,
@@ -1216,11 +1722,12 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   rowActionDanger: {
-    flex: 1,
+    flexGrow: 1,
     borderRadius: 8,
     borderWidth: 1,
     borderColor: '#5f2438',
     paddingVertical: 10,
+    paddingHorizontal: 12,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: COLORS.dangerSoft,
@@ -1280,18 +1787,5 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 20,
   },
-  inlineAction: {
-    alignSelf: 'flex-start',
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    backgroundColor: COLORS.panelMuted,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  inlineActionText: {
-    color: COLORS.text,
-    fontSize: 13,
-    fontWeight: '600',
-  },
 });
+

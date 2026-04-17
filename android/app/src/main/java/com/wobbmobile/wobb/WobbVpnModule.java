@@ -1,11 +1,14 @@
 package com.wobbmobile.wobb;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.os.Build;
 import android.net.VpnService;
+import android.os.Build;
+
 import java.util.UUID;
 
 import androidx.annotation.NonNull;
@@ -13,8 +16,8 @@ import androidx.annotation.Nullable;
 import androidx.core.content.ContextCompat;
 
 import com.facebook.react.bridge.ActivityEventListener;
-import com.facebook.react.bridge.BaseActivityEventListener;
 import com.facebook.react.bridge.Arguments;
+import com.facebook.react.bridge.BaseActivityEventListener;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
@@ -185,6 +188,45 @@ public class WobbVpnModule extends ReactContextBaseJavaModule {
             promise.resolve(null);
         } catch (Exception exception) {
             promise.reject("E_STORAGE_REMOVE", exception);
+        }
+    }
+
+    @ReactMethod
+    public void setClipboardText(String value, Promise promise) {
+        try {
+            ClipboardManager clipboard = (ClipboardManager) getReactApplicationContext().getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard == null) {
+                promise.reject("E_CLIPBOARD", "Clipboard service is unavailable.");
+                return;
+            }
+
+            ClipData clipData = ClipData.newPlainText("wobb", value == null ? "" : value);
+            clipboard.setPrimaryClip(clipData);
+            promise.resolve(true);
+        } catch (Exception exception) {
+            promise.reject("E_CLIPBOARD_WRITE", exception);
+        }
+    }
+
+    @ReactMethod
+    public void getClipboardText(Promise promise) {
+        try {
+            ClipboardManager clipboard = (ClipboardManager) getReactApplicationContext().getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard == null) {
+                promise.resolve(null);
+                return;
+            }
+
+            ClipData clipData = clipboard.getPrimaryClip();
+            if (clipData == null || clipData.getItemCount() == 0) {
+                promise.resolve(null);
+                return;
+            }
+
+            CharSequence text = clipData.getItemAt(0).coerceToText(getReactApplicationContext());
+            promise.resolve(text == null ? null : text.toString());
+        } catch (Exception exception) {
+            promise.reject("E_CLIPBOARD_READ", exception);
         }
     }
 
