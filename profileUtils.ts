@@ -49,6 +49,15 @@ export type ValidationResult = {
   fieldErrors: Partial<Record<keyof LocalProfile, string>>;
 };
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const IPV4_PATTERN = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+const IPV6_PATTERN = /^[0-9a-f:]+$/i;
+const DOMAIN_PATTERN = /^(?=.{1,253}$)(?!-)(?:[a-z0-9-]{1,63}\.)+[a-z]{2,63}$/i;
+const SERVER_NAME_PATTERN = /^[a-z0-9.-]+$/i;
+const PUBLIC_KEY_PATTERN = /^[A-Za-z0-9_-]{16,}$/;
+const SHORT_ID_PATTERN = /^(?:[0-9a-fA-F]{2}){1,16}$/;
+const FINGERPRINT_PATTERN = /^[a-z0-9_-]{2,32}$/i;
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -83,6 +92,26 @@ export function isPlaceholderValue(value: unknown): boolean {
     normalized === 'test-public-key' ||
     normalized === 'test-short-id'
   );
+}
+
+function looksLikeHost(value: string): boolean {
+  if (!value || value.includes('://') || /[\s/?#]/.test(value)) {
+    return false;
+  }
+
+  return DOMAIN_PATTERN.test(value) || IPV4_PATTERN.test(value) || IPV6_PATTERN.test(value) || value === 'localhost';
+}
+
+function looksLikeServerName(value: string): boolean {
+  return Boolean(value) && !value.includes('://') && !/[\s/?#]/.test(value) && SERVER_NAME_PATTERN.test(value);
+}
+
+function looksLikePublicKey(value: string): boolean {
+  return PUBLIC_KEY_PATTERN.test(value);
+}
+
+function looksLikeShortId(value: string): boolean {
+  return SHORT_ID_PATTERN.test(value);
 }
 
 export function createEmptyProfile(overrides: Partial<LocalProfile> = {}): LocalProfile {
@@ -154,24 +183,34 @@ export function validateProfile(profile: LocalProfile): ValidationResult {
   }
   if (!host || isPlaceholderValue(host)) {
     push('host', 'Server host is required.');
+  } else if (!looksLikeHost(host)) {
+    push('host', 'Server host must be a domain, IPv4, IPv6, or localhost.');
   }
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     push('port', 'Server port must be between 1 and 65535.');
   }
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uuid)) {
+  if (!UUID_PATTERN.test(uuid)) {
     push('uuid', 'UUID must be a valid UUID.');
   }
   if (!serverName || isPlaceholderValue(serverName)) {
     push('serverName', 'Server name is required.');
+  } else if (!looksLikeServerName(serverName)) {
+    push('serverName', 'Server name must be a hostname without scheme or path.');
   }
   if (!publicKey || isPlaceholderValue(publicKey)) {
     push('publicKey', 'REALITY public key is required.');
+  } else if (!looksLikePublicKey(publicKey)) {
+    push('publicKey', 'REALITY public key format looks invalid.');
   }
   if (!shortId || isPlaceholderValue(shortId)) {
     push('shortId', 'REALITY short ID is required.');
+  } else if (!looksLikeShortId(shortId)) {
+    push('shortId', 'REALITY short ID must be 2-32 hex characters.');
   }
   if (!fingerprint) {
     push('fingerprint', 'Fingerprint is required.');
+  } else if (!FINGERPRINT_PATTERN.test(fingerprint)) {
+    push('fingerprint', 'Fingerprint format looks invalid.');
   }
 
   return {
@@ -310,6 +349,10 @@ export function parseVlessUri(input: string): LocalProfile {
   const security = parsed.searchParams.get('security');
   if (security && security.toLowerCase() !== 'reality') {
     throw new Error('Only VLESS REALITY profiles are supported.');
+  }
+
+  if (!parsed.username || !parsed.hostname) {
+    throw new Error('The VLESS URI must include a UUID and host.');
   }
 
   const profile = createEmptyProfile({

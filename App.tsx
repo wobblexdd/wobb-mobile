@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -777,6 +777,7 @@ export default function App() {
         setConnectionState('disconnecting');
         appendLog('app', 'Stopping VPN tunnel.');
         await VpnInterface.stop();
+        appendLog('app', 'Disconnect requested by user.');
         setConnectionState('idle');
         return;
       }
@@ -785,8 +786,10 @@ export default function App() {
         throw new Error('Add and select a profile before connecting.');
       }
 
+      appendLog('app', `Selected profile ${activeProfile.name} (${profileEndpoint(activeProfile)}).`);
       const validation = validateProfile(activeProfile);
       if (!validation.valid) {
+        appendLog('app', `Validation failed: ${validation.errors[0]}.`, 'error');
         throw new Error(validation.errors[0]);
       }
 
@@ -794,7 +797,9 @@ export default function App() {
       setConnectionState('connecting');
       appendLog('app', `Starting tunnel to ${profileEndpoint(activeProfile)}.`);
       await VpnInterface.prepare();
+      appendLog('app', 'VPN permission granted.');
       await VpnInterface.start(config);
+      appendLog('app', 'Native start request accepted; waiting for tunnel status.');
     } catch (error) {
       setConnectionState('error');
       setErrorText(error instanceof Error ? error.message : 'Connection failed.');
@@ -1788,4 +1793,5 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
 });
+
 
