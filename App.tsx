@@ -3,7 +3,9 @@ import {
   ActivityIndicator,
   Alert,
   DeviceEventEmitter,
+  LayoutAnimation,
   NativeModules,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -12,6 +14,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  UIManager,
   View,
 } from 'react-native';
 import * as storage from './storage';
@@ -74,24 +77,24 @@ const HELPER_API_BASE_CANDIDATES = ['http://127.0.0.1:3000', 'http://10.0.2.2:30
 
 const ONBOARDING_SLIDES: OnboardingSlide[] = [
   {
-    eyebrow: 'Self-hosted first',
-    title: 'Bring your own VLESS server',
-    body: 'Wobb stores your REALITY profiles locally so you can connect without a hosted account layer.',
+    eyebrow: 'Self-hosted',
+    title: 'Connect with your own server',
+    body: 'Wobb keeps your VLESS and REALITY profiles on the device so the core flow stays local and account-free.',
   },
   {
     eyebrow: 'Import or create',
-    title: 'Keep one clean source of truth',
-    body: 'Paste a VLESS URI, import supported JSON, or enter the profile fields manually and validate them before connect.',
+    title: 'Choose the setup that fits your workflow',
+    body: 'Paste a VLESS URI, import supported JSON, or enter the fields manually with validation before you connect.',
   },
   {
-    eyebrow: 'Real runtime state',
-    title: 'See exactly what happened',
-    body: 'Connection status, endpoint, and recent logs stay visible so runtime issues are easy to inspect.',
+    eyebrow: 'Bootstrap',
+    title: 'Plan a clean VPS rollout',
+    body: 'Use the helper service to draft the server setup steps, then turn the result into a saved local profile.',
   },
   {
-    eyebrow: 'Bootstrap when needed',
-    title: 'Plan a new VPS setup',
-    body: 'Use the helper service to generate a setup plan, then save the final profile locally on the device.',
+    eyebrow: 'Runtime clarity',
+    title: 'Keep status and logs in view',
+    body: 'Connection state, selected endpoint, and recent logs stay readable so real runtime issues are easy to debug.',
   },
 ];
 
@@ -110,6 +113,10 @@ const COLORS = {
   danger: '#fca5a5',
   dangerSoft: '#3f1d2e',
 };
+
+function animateLayout() {
+  LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+}
 
 type WobbVpnBridge = {
   prepareVpn?: () => Promise<{ granted?: boolean }>;
@@ -411,6 +418,12 @@ export default function App() {
     activeProfileIdRef.current = activeProfileId;
   }, [activeProfileId]);
 
+  useEffect(() => {
+    if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+      UIManager.setLayoutAnimationEnabledExperimental(true);
+    }
+  }, []);
+
   const activeProfile = useMemo(
     () => profiles.find((profile) => profile.id === activeProfileId) || null,
     [profiles, activeProfileId]
@@ -543,11 +556,13 @@ export default function App() {
   }, []);
 
   async function handleCompleteOnboarding() {
+    animateLayout();
     await writeOnboardingComplete(true);
     setOnboardingComplete(true);
   }
 
   function handleOpenCreateProfile() {
+    animateLayout();
     setEditingProfileId(null);
     setFormDraft(createEmptyProfile());
     setErrorText(null);
@@ -555,6 +570,7 @@ export default function App() {
   }
 
   function handleOpenEditProfile(profile: LocalProfile) {
+    animateLayout();
     setEditingProfileId(profile.id);
     setFormDraft(createEmptyProfile(profile));
     setErrorText(null);
@@ -570,6 +586,7 @@ export default function App() {
       const nextActiveId = editingProfileId === activeProfileId ? savedProfile.id : activeProfileId || savedProfile.id;
 
       await persistProfiles(nextProfiles, nextActiveId);
+      animateLayout();
       setViewMode('home');
       setEditingProfileId(null);
       setErrorText(null);
@@ -602,6 +619,7 @@ export default function App() {
   async function handleDuplicateProfile(profile: LocalProfile) {
     const duplicate = duplicateProfile(profile);
     await persistProfiles([duplicate, ...profiles], duplicate.id);
+    animateLayout();
     setViewMode('home');
     appendLog('app', `Duplicated profile ${profile.name}.`);
   }
@@ -655,6 +673,46 @@ export default function App() {
     }
   }
 
+  async function handleCopyBootstrapCommands() {
+    if (!bootstrapPlan?.commandSnippets?.length) {
+      setErrorText('No bootstrap commands are available yet.');
+      return;
+    }
+
+    const payload = bootstrapPlan.commandSnippets.join('\n');
+    try {
+      const copied = await copyText(payload);
+      if (copied) {
+        appendLog('helper', 'Bootstrap commands copied to clipboard.');
+        return;
+      }
+
+      await Share.share({ message: payload });
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : 'Failed to export bootstrap commands.');
+    }
+  }
+
+  async function handleCopyBootstrapSummary() {
+    if (!bootstrapPlan?.summary) {
+      setErrorText('No ready profile summary is available yet.');
+      return;
+    }
+
+    const payload = [bootstrapPlan.summary, bootstrapPlan.shareLink || ''].filter(Boolean).join('\n\n');
+    try {
+      const copied = await copyText(payload);
+      if (copied) {
+        appendLog('helper', 'Bootstrap profile summary copied to clipboard.');
+        return;
+      }
+
+      await Share.share({ message: payload });
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : 'Failed to export bootstrap profile summary.');
+    }
+  }
+
   async function handleCopyLogs() {
     if (logs.length === 0) {
       setErrorText('No logs to copy.');
@@ -700,6 +758,7 @@ export default function App() {
   function handleImportText() {
     try {
       const imported = parseProfileImport(importText);
+      animateLayout();
       setEditingProfileId(null);
       setFormDraft(imported);
       setViewMode('form');
@@ -764,6 +823,7 @@ export default function App() {
       publicPort: String((source as Partial<LocalProfile> | undefined)?.port || bootstrapDraft.publicPort),
     });
 
+    animateLayout();
     setEditingProfileId(null);
     setFormDraft(nextProfile);
     setViewMode('form');
@@ -836,6 +896,20 @@ export default function App() {
   if (!onboardingComplete) {
     const currentSlide = ONBOARDING_SLIDES[Math.min(onboardingStep, ONBOARDING_SLIDES.length - 1)];
     const finalStep = onboardingStep >= ONBOARDING_SLIDES.length - 1;
+    const nextActions = [
+      {
+        title: 'Create profile',
+        body: 'Enter host, port, UUID, SNI, and REALITY values manually.',
+      },
+      {
+        title: 'Import profile',
+        body: 'Paste a VLESS URI or supported JSON and review it before save.',
+      },
+      {
+        title: 'Bootstrap server',
+        body: 'Generate a setup plan, then turn the result into a local profile.',
+      },
+    ];
 
     return (
       <SafeAreaView style={styles.root}>
@@ -848,6 +922,16 @@ export default function App() {
             <Text style={styles.onboardingEyebrow}>{currentSlide.eyebrow}</Text>
             <Text style={styles.onboardingTitle}>{currentSlide.title}</Text>
             <Text style={styles.onboardingBody}>{currentSlide.body}</Text>
+            <Text style={styles.onboardingProgressText}>Step {onboardingStep + 1} of {ONBOARDING_SLIDES.length}</Text>
+
+            <View style={styles.onboardingGuideCard}>
+              {nextActions.map((action) => (
+                <View key={action.title} style={styles.onboardingGuideItem}>
+                  <Text style={styles.onboardingGuideTitle}>{action.title}</Text>
+                  <Text style={styles.onboardingGuideText}>{action.body}</Text>
+                </View>
+              ))}
+            </View>
           </View>
 
           <View style={styles.onboardingFooter}>
@@ -869,11 +953,12 @@ export default function App() {
                   if (finalStep) {
                     handleCompleteOnboarding().catch(() => undefined);
                   } else {
+                    animateLayout();
                     setOnboardingStep((current) => current + 1);
                   }
                 }}
               >
-                <Text style={styles.primaryButtonText}>{finalStep ? 'Start' : 'Continue'}</Text>
+                <Text style={styles.primaryButtonText}>{finalStep ? 'Open Wobb' : 'Continue'}</Text>
               </Pressable>
             </View>
           </View>
@@ -890,29 +975,21 @@ export default function App() {
         <StatusBar barStyle="light-content" backgroundColor={COLORS.background} />
         <ScrollView contentContainerStyle={styles.scrollContent}>
           <View style={styles.headerRow}>
-            <Text style={styles.screenTitle}>{editingProfileId ? 'Edit profile' : 'New profile'}</Text>
-            <Pressable style={styles.secondaryButtonCompact} onPress={() => setViewMode('home')}>
+            <View style={styles.headerCopy}>
+              <Text style={styles.screenTitle}>{editingProfileId ? 'Edit profile' : 'New profile'}</Text>
+              <Text style={styles.screenSubtitle}>Keep one clean local source of truth for this server.</Text>
+            </View>
+            <Pressable style={styles.secondaryButtonCompact} onPress={() => { animateLayout(); setViewMode('home'); }}>
               <Text style={styles.secondaryButtonText}>Back</Text>
             </Pressable>
           </View>
 
           <View style={styles.panel}>
-            <Text style={styles.panelTitle}>Manual profile</Text>
-            <Text style={styles.panelText}>Enter the VLESS and REALITY details exactly as your server expects them.</Text>
+            <Text style={styles.panelTitle}>Basics</Text>
+            <Text style={styles.panelText}>Start with the name, endpoint, and mode you expect to use most often.</Text>
             <FormField label="Profile name" value={formDraft.name} onChangeText={(value) => setFormDraft((current) => ({ ...current, name: value }))} placeholder="My VPS" />
             <FormField label="Server host" value={formDraft.host} onChangeText={(value) => setFormDraft((current) => ({ ...current, host: value }))} placeholder="157.90.116.123" />
             <FormField label="Port" value={formDraft.port} onChangeText={(value) => setFormDraft((current) => ({ ...current, port: value }))} keyboardType="numeric" />
-            <FormField label="UUID" value={formDraft.uuid} onChangeText={(value) => setFormDraft((current) => ({ ...current, uuid: value }))} />
-            <Pressable style={styles.inlineAction} onPress={() => setFormDraft((current) => ({ ...current, uuid: generateUuid() }))}>
-              <Text style={styles.inlineActionText}>Generate UUID</Text>
-            </Pressable>
-            <FormField label="Server name / SNI" value={formDraft.serverName} onChangeText={(value) => setFormDraft((current) => ({ ...current, serverName: value }))} />
-            <FormField label="REALITY public key" value={formDraft.publicKey} onChangeText={(value) => setFormDraft((current) => ({ ...current, publicKey: value }))} />
-            <FormField label="REALITY short ID" value={formDraft.shortId} onChangeText={(value) => setFormDraft((current) => ({ ...current, shortId: value }))} />
-            <FormField label="Fingerprint" value={formDraft.fingerprint} onChangeText={(value) => setFormDraft((current) => ({ ...current, fingerprint: value }))} />
-            <FormField label="Spider X" value={formDraft.spiderX} onChangeText={(value) => setFormDraft((current) => ({ ...current, spiderX: value }))} />
-            <FormField label="Flow" value={formDraft.flow} onChangeText={(value) => setFormDraft((current) => ({ ...current, flow: value }))} />
-            <FormField label="Remarks" value={formDraft.remarks} onChangeText={(value) => setFormDraft((current) => ({ ...current, remarks: value }))} multiline />
             <View style={styles.fieldGroup}>
               <Text style={styles.fieldLabel}>Mode</Text>
               <SegmentedToggle
@@ -924,7 +1001,34 @@ export default function App() {
                 ]}
               />
             </View>
-            {draftValidation.valid ? null : <Text style={styles.warningText}>{validationText(draftValidation)}</Text>}
+          </View>
+
+          <View style={styles.panel}>
+            <Text style={styles.panelTitle}>REALITY values</Text>
+            <Text style={styles.panelText}>These fields must match the inbound on your own server exactly.</Text>
+            <FormField label="UUID" value={formDraft.uuid} onChangeText={(value) => setFormDraft((current) => ({ ...current, uuid: value }))} />
+            <Pressable style={styles.inlineAction} onPress={() => setFormDraft((current) => ({ ...current, uuid: generateUuid() }))}>
+              <Text style={styles.inlineActionText}>Generate UUID</Text>
+            </Pressable>
+            <FormField label="Server name / SNI" value={formDraft.serverName} onChangeText={(value) => setFormDraft((current) => ({ ...current, serverName: value }))} />
+            <FormField label="REALITY public key" value={formDraft.publicKey} onChangeText={(value) => setFormDraft((current) => ({ ...current, publicKey: value }))} />
+            <FormField label="REALITY short ID" value={formDraft.shortId} onChangeText={(value) => setFormDraft((current) => ({ ...current, shortId: value }))} />
+            <FormField label="Fingerprint" value={formDraft.fingerprint} onChangeText={(value) => setFormDraft((current) => ({ ...current, fingerprint: value }))} />
+          </View>
+
+          <View style={styles.panel}>
+            <Text style={styles.panelTitle}>Advanced</Text>
+            <Text style={styles.panelText}>Leave these as defaults unless your server profile says otherwise.</Text>
+            <FormField label="Spider X" value={formDraft.spiderX} onChangeText={(value) => setFormDraft((current) => ({ ...current, spiderX: value }))} />
+            <FormField label="Flow" value={formDraft.flow} onChangeText={(value) => setFormDraft((current) => ({ ...current, flow: value }))} />
+            <FormField label="Remarks" value={formDraft.remarks} onChangeText={(value) => setFormDraft((current) => ({ ...current, remarks: value }))} multiline />
+          </View>
+
+          <View style={styles.panel}>
+            <Text style={styles.panelTitle}>Validation</Text>
+            <Text style={styles.panelText}>
+              {draftValidation.valid ? 'This draft is ready to save.' : validationText(draftValidation)}
+            </Text>
             <View style={styles.buttonRow}>
               <Pressable style={[styles.primaryButton, styles.flexButton]} onPress={handleSaveProfile}>
                 <Text style={styles.primaryButtonText}>{editingProfileId ? 'Save changes' : 'Save profile'}</Text>
@@ -932,6 +1036,7 @@ export default function App() {
               <Pressable
                 style={[styles.secondaryButton, styles.flexButton]}
                 onPress={() => {
+                  animateLayout();
                   setEditingProfileId(null);
                   setFormDraft(createEmptyProfile());
                   setErrorText(null);
@@ -952,15 +1057,18 @@ export default function App() {
         <StatusBar barStyle="light-content" backgroundColor={COLORS.background} />
         <ScrollView contentContainerStyle={styles.scrollContent}>
           <View style={styles.headerRow}>
-            <Text style={styles.screenTitle}>Import profile</Text>
-            <Pressable style={styles.secondaryButtonCompact} onPress={() => setViewMode('home')}>
+            <View style={styles.headerCopy}>
+              <Text style={styles.screenTitle}>Import profile</Text>
+              <Text style={styles.screenSubtitle}>Bring in a profile from a share link, JSON object, or prepared Xray config.</Text>
+            </View>
+            <Pressable style={styles.secondaryButtonCompact} onPress={() => { animateLayout(); setViewMode('home'); }}>
               <Text style={styles.secondaryButtonText}>Back</Text>
             </Pressable>
           </View>
 
           <View style={styles.panel}>
-            <Text style={styles.panelTitle}>Paste VLESS URI or JSON</Text>
-            <Text style={styles.panelText}>Import a VLESS REALITY share link, a profile JSON object, or a config with a VLESS outbound.</Text>
+            <Text style={styles.panelTitle}>Paste input</Text>
+            <Text style={styles.panelText}>Imported profiles always open as editable drafts before they are saved locally.</Text>
             <TextInput
               value={importText}
               onChangeText={setImportText}
@@ -983,16 +1091,16 @@ export default function App() {
                 <Text style={styles.secondaryButtonText}>QR import</Text>
               </Pressable>
               <Pressable style={[styles.primaryButton, styles.flexButton]} onPress={handleImportText}>
-                <Text style={styles.primaryButtonText}>Import draft</Text>
+                <Text style={styles.primaryButtonText}>Open draft</Text>
               </Pressable>
             </View>
           </View>
 
           <View style={styles.panel}>
-            <Text style={styles.panelTitle}>Quick notes</Text>
-            <Text style={styles.stepText}>1. QR import can be added later without changing the profile model.</Text>
-            <Text style={styles.stepText}>2. Imported profiles are opened as editable drafts before they are saved.</Text>
-            <Text style={styles.stepText}>3. Placeholder or incomplete values are rejected before connect.</Text>
+            <Text style={styles.panelTitle}>Import paths</Text>
+            <Text style={styles.stepText}>1. VLESS URI: fastest path when you already have a share link.</Text>
+            <Text style={styles.stepText}>2. JSON import: useful when your profile came from another Xray tool.</Text>
+            <Text style={styles.stepText}>3. QR import: the entry point is ready now and camera support can land without changing the profile model.</Text>
           </View>
         </ScrollView>
       </SafeAreaView>
@@ -1005,15 +1113,18 @@ export default function App() {
         <StatusBar barStyle="light-content" backgroundColor={COLORS.background} />
         <ScrollView contentContainerStyle={styles.scrollContent}>
           <View style={styles.headerRow}>
-            <Text style={styles.screenTitle}>Bootstrap VPS</Text>
-            <Pressable style={styles.secondaryButtonCompact} onPress={() => setViewMode('home')}>
+            <View style={styles.headerCopy}>
+              <Text style={styles.screenTitle}>Bootstrap server</Text>
+              <Text style={styles.screenSubtitle}>Generate a clean manual rollout plan and turn it into a local profile when the final REALITY values are known.</Text>
+            </View>
+            <Pressable style={styles.secondaryButtonCompact} onPress={() => { animateLayout(); setViewMode('home'); }}>
               <Text style={styles.secondaryButtonText}>Back</Text>
             </Pressable>
           </View>
 
           <View style={styles.panel}>
-            <Text style={styles.panelTitle}>Setup plan</Text>
-            <Text style={styles.panelText}>Generate a manual setup plan. If UUID, public key, and short ID are already known, Wobb can turn the result into a ready profile.</Text>
+            <Text style={styles.panelTitle}>Server inputs</Text>
+            <Text style={styles.panelText}>These fields shape the setup steps and the shareable profile draft.</Text>
             <FormField label="Profile name" value={bootstrapDraft.profileName} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, profileName: value }))} />
             <FormField label="Public host" value={bootstrapDraft.publicHost} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, publicHost: value }))} placeholder="157.90.116.123" />
             <FormField label="Public port" value={bootstrapDraft.publicPort} onChangeText={(value) => setBootstrapDraft((current) => ({ ...current, publicPort: value }))} keyboardType="numeric" />
@@ -1044,7 +1155,7 @@ export default function App() {
 
           {bootstrapPlan ? (
             <View style={styles.panel}>
-              <Text style={styles.panelTitle}>Plan result</Text>
+              <Text style={styles.panelTitle}>Generated plan</Text>
               <Text style={styles.detailValue}>Profile ready: {bootstrapPlan.profileReady ? 'Yes' : 'Not yet'}</Text>
               {bootstrapPlan.missingFields && bootstrapPlan.missingFields.length > 0 ? (
                 <Text style={styles.warningText}>Missing fields: {bootstrapPlan.missingFields.join(', ')}</Text>
@@ -1055,11 +1166,21 @@ export default function App() {
               {bootstrapPlan.commandSnippets?.length ? (
                 <Text style={styles.panelText}>Generated commands: {bootstrapPlan.commandSnippets.length}</Text>
               ) : null}
-              <Pressable style={styles.secondaryButton} onPress={handleUseBootstrapDraft}>
-                <Text style={styles.secondaryButtonText}>
-                  {bootstrapPlan.profileReady ? 'Import ready profile' : 'Open draft profile'}
-                </Text>
-              </Pressable>
+              <View style={styles.buttonRow}>
+                <Pressable style={[styles.primaryButton, styles.flexButton]} onPress={handleUseBootstrapDraft}>
+                  <Text style={styles.primaryButtonText}>
+                    {bootstrapPlan.profileReady ? 'Use ready profile' : 'Open draft profile'}
+                  </Text>
+                </Pressable>
+                <Pressable style={[styles.secondaryButton, styles.flexButton]} onPress={handleCopyBootstrapCommands}>
+                  <Text style={styles.secondaryButtonText}>Copy commands</Text>
+                </Pressable>
+              </View>
+              {bootstrapPlan.summary ? (
+                <Pressable style={styles.secondaryButton} onPress={handleCopyBootstrapSummary}>
+                  <Text style={styles.secondaryButtonText}>Copy summary</Text>
+                </Pressable>
+              ) : null}
             </View>
           ) : null}
         </ScrollView>
@@ -1117,7 +1238,7 @@ export default function App() {
         <View style={styles.header}>
           <View style={styles.headerCopy}>
             <Text style={styles.screenTitle}>Wobb</Text>
-            <Text style={styles.screenSubtitle}>Self-hosted VLESS and REALITY client</Text>
+            <Text style={styles.screenSubtitle}>Self-hosted VLESS / REALITY client</Text>
           </View>
           <View style={[styles.stateBadge, { backgroundColor: tone.background }]}> 
             <Text style={[styles.stateBadgeText, { color: tone.text }]}>{stateLabel(connectionState)}</Text>
@@ -1129,7 +1250,7 @@ export default function App() {
             <Text style={styles.sectionLabel}>Active profile</Text>
             <Text style={styles.connectionTitle}>{activeProfile ? activeProfile.name : 'No profile selected'}</Text>
             <Text style={styles.connectionSubtitle}>
-              {activeProfile ? `${profileEndpoint(activeProfile)} | ${activeProfile.serverName}` : 'Create or import a local profile to start.'}
+              {activeProfile ? `${profileEndpoint(activeProfile)} | ${activeProfile.serverName}` : 'Create, import, or bootstrap a profile to get started.'}
             </Text>
           </View>
 
@@ -1194,7 +1315,7 @@ export default function App() {
           {filteredProfiles.length === 0 ? (
             <EmptyState
               title="No saved profiles"
-              body="Create a profile manually or import a VLESS URI to start connecting from this device."
+              body="Create a profile manually, paste a VLESS URI, or use bootstrap planning to prepare your own server."
               actionLabel="Open import"
               onPress={() => setViewMode('import')}
             />
@@ -1256,7 +1377,7 @@ export default function App() {
           </View>
           <View style={styles.logContainer}>
             {logs.length === 0 ? (
-              <Text style={styles.logEmpty}>No logs yet.</Text>
+              <Text style={styles.logEmpty}>No runtime logs yet. Connect once to start building a local history.</Text>
             ) : (
               logs.map((entry) => (
                 <View key={entry.id} style={styles.logRow}>
@@ -1344,6 +1465,35 @@ const styles = StyleSheet.create({
     lineHeight: 24,
     marginTop: 16,
     maxWidth: 320,
+  },
+  onboardingProgressText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 18,
+    textTransform: 'uppercase',
+  },
+  onboardingGuideCard: {
+    marginTop: 18,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.panelMuted,
+    padding: 14,
+    gap: 12,
+  },
+  onboardingGuideItem: {
+    gap: 4,
+  },
+  onboardingGuideTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  onboardingGuideText: {
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 18,
   },
   onboardingFooter: {
     gap: 18,
