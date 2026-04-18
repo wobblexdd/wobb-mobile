@@ -1,0 +1,7 @@
+﻿# Copy this file to android/signing.properties and fill in real values.
+# The release build will remain unsigned until these values are provided.
+
+WOBB_RELEASE_STORE_FILE=keystore\wobb-release.jks
+WOBB_RELEASE_STORE_PASSWORD=change-me
+WOBB_RELEASE_KEY_ALIAS=wobb
+WOBB_RELEASE_KEY_PASSWORD=change-me

@@ -2,13 +2,17 @@
   "name": "wobb-mobile",
   "version": "1.0.0",
   "private": true,
-  "description": "WOBB mobile client",
+  "description": "Self-hosted WOBB mobile client for VLESS / REALITY",
   "main": "index.js",
   "scripts": {
     "start": "react-native start --config metro.config.js",
     "android": "react-native run-android",
     "reverse": "adb reverse tcp:3000 tcp:3000",
-    "android:clean": "cd android && gradlew clean"
+    "android:clean": "node scripts/android-gradle.js clean",
+    "android:debug-apk": "node scripts/android-gradle.js assembleDebug",
+    "android:release-apk": "node scripts/android-gradle.js assembleRelease",
+    "android:release-bundle": "node scripts/android-gradle.js bundleRelease",
+    "android:install-debug": "node scripts/android-gradle.js installDebug"
   },
   "license": "MIT",
   "dependencies": {

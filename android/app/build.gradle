@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id 'com.android.application'
 }
@@ -9,8 +11,57 @@ def bundleOutput = new File(projectDir, "src/main/assets/index.android.bundle")
 def assetsDest = new File(projectDir, "src/main/res")
 def cmakePath = { File file -> file.absolutePath.replace('\\', '/') }
 
+def signingProperties = new Properties()
+def signingPropertiesFile = new File(rootDir, 'signing.properties')
+if (signingPropertiesFile.exists()) {
+    signingPropertiesFile.withInputStream { stream ->
+        signingProperties.load(stream)
+    }
+}
+
+def envOrSigningProperty = { String key ->
+    def envValue = System.getenv(key)
+    if (envValue != null && envValue.toString().trim()) {
+        return envValue.toString().trim()
+    }
+
+    def fileValue = signingProperties.getProperty(key)
+    if (fileValue != null && fileValue.toString().trim()) {
+        return fileValue.toString().trim()
+    }
+
+    def gradleValue = project.findProperty(key)
+    return gradleValue != null && gradleValue.toString().trim() ? gradleValue.toString().trim() : null
+}
+
+def resolveSigningFile = { String filePath ->
+    if (!filePath) {
+        return null
+    }
+
+    File candidate = new File(filePath)
+    return candidate.isAbsolute() ? candidate : new File(rootDir, filePath)
+}
+
+def releaseStoreFile = envOrSigningProperty('WOBB_RELEASE_STORE_FILE')
+def releaseStorePassword = envOrSigningProperty('WOBB_RELEASE_STORE_PASSWORD')
+def releaseKeyAlias = envOrSigningProperty('WOBB_RELEASE_KEY_ALIAS')
+def releaseKeyPassword = envOrSigningProperty('WOBB_RELEASE_KEY_PASSWORD')
+def hasReleaseSigning = [releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword].every { value -> value != null && value.toString().trim() }
+
 android {
     namespace 'com.wobbmobile.wobb'
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile resolveSigningFile(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
     compileSdk 35
 
     buildFeatures {
@@ -41,6 +92,9 @@ android {
         }
         release {
             minifyEnabled false
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }

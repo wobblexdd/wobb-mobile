@@ -30,3 +30,7 @@ android/app/src/main/res/raw/
 .env.*
 !.env.example
 !.env.production.example
+
+android/signing.properties
+*.apk
+*.aab
